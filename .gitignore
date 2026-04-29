@@ -1,0 +1,23 @@
+# secrets
+.env
+
+# recordings output — keep the placeholder
+recordings/*
+!recordings/.gitkeep
+
+# logs written by the bot
+recordings/logs/
+
+# filebrowser runtime DB
+filebrowser/filebrowser.db
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# claude code local settings
+.claude/
