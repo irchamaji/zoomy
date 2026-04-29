@@ -51,6 +51,9 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 RUN playwright install chromium
 RUN playwright install-deps chromium
 
+ARG WHISPER_MODEL=medium
+RUN python3 -c "from faster_whisper import WhisperModel; WhisperModel('${WHISPER_MODEL}', device='cpu', compute_type='int8')"
+
 COPY . .
 RUN chmod +x entrypoint.sh
 

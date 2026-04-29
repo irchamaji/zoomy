@@ -1,3 +1,4 @@
 python-telegram-bot>=21.0
 playwright>=1.44
 randomname==0.2.1
+faster-whisper>=1.0.0

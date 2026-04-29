@@ -133,6 +133,7 @@ class ZoomRecorder:
         self,
         display: str = ":99",
         sink: str = "virtual.monitor",
+        username: str = "user",
         guest_name: str = GUEST_NAME,
         recording_prefix: Optional[str] = None,
         resolution: str = "1080p",
@@ -142,6 +143,7 @@ class ZoomRecorder:
     ):
         self.display = display
         self.sink = sink
+        self.username = username
         self.guest_name = guest_name
         self.recording_prefix = recording_prefix
         self.resolution = resolution
@@ -186,12 +188,13 @@ class ZoomRecorder:
             meeting_id, password = parse_zoom_url(url)
             web_url = build_web_client_url(meeting_id, password)
 
-            RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
             if not self.recording_prefix:
                 self.recording_prefix = randomname.get_name()
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            stem = f"{self.recording_prefix}_{timestamp}_{meeting_id}"
-            self.output_path = RECORDINGS_DIR / f"{stem}.mp4"
+            datestamp = datetime.now().strftime("%Y%m%d")
+            folder_stem = f"{self.username}_{self.recording_prefix}_{datestamp}"
+            recording_dir = RECORDINGS_DIR / folder_stem
+            recording_dir.mkdir(parents=True, exist_ok=True)
+            self.output_path = recording_dir / f"{self.recording_prefix}.mp4"
 
             logger.info("Joining %s (display=%s)", web_url, self.display)
             logger.info("Output: %s", self.output_path)
@@ -224,7 +227,7 @@ class ZoomRecorder:
                 logger.info("FFmpeg started → %s", self.output_path)
 
                 if self.on_started:
-                    await self.on_started(self.output_path.name)
+                    await self.on_started(str(self.output_path))
 
                 await self._watch_meeting(page)
                 self._auto_ended = not self._stop_event.is_set()
@@ -247,10 +250,10 @@ class ZoomRecorder:
                 reason = "host ended" if self._auto_ended else "manual stop"
                 logger.info(
                     "Recording done — %s | duration=%s | size=%s | reason=%s",
-                    self.output_path.name, duration_str, size_str, reason,
+                    self.output_path.parent.name, duration_str, size_str, reason,
                 )
                 await self.on_stopped(
-                    self.output_path.name, duration_str, size_str, self._auto_ended,
+                    str(self.output_path), duration_str, size_str, self._auto_ended,
                 )
 
     async def stop(self) -> None:
@@ -455,12 +458,9 @@ class ZoomRecorder:
             "-movflags", "+faststart",
             output,
         ]
-        # Write FFmpeg output to logs dir (avoids PIPE buffer blocking)
-        log_dir = RECORDINGS_DIR / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / (Path(output).stem + ".ffmpeg.log")
+        log_path = Path(output).parent / "ffmpeg.log"
         ffmpeg_log = open(log_path, "w", encoding="utf-8")
-        logger.info("FFmpeg log → logs/%s", log_path.name)
+        logger.info("FFmpeg log → %s", log_path)
         return subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
