@@ -15,6 +15,8 @@ from telegram.ext import (
     filters,
 )
 
+import transcriber as transcriber_mod
+
 from recorder import ZoomRecorder, _display_pool
 from store import RecordingSession, SessionStore
 
@@ -51,8 +53,50 @@ AUTHORIZED_IDS = {
     if x.strip()
 }
 DEFAULT_GUEST_NAME = os.environ.get("GUEST_NAME", "Zoomy")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "medium")
+WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "id") or None
 
 store = SessionStore()
+
+_transcription_queue: asyncio.Queue = asyncio.Queue()
+_pending_transcriptions: dict[str, str] = {}  # session_key → mp4_path
+
+
+async def _transcription_worker(bot) -> None:
+    while True:
+        mp4_path, chat_id, session_key = await _transcription_queue.get()
+        await bot.send_message(chat_id, f"Transcribing session {session_key}…")
+        try:
+            txt, srt = await transcriber_mod.transcribe(mp4_path, WHISPER_MODEL, WHISPER_LANGUAGE)
+            name = Path(txt).stem
+            await bot.send_message(
+                chat_id,
+                f"Transcript saved — Session {session_key}\n  {name}.txt\n  {name}.srt",
+            )
+        except Exception as e:
+            await bot.send_message(chat_id, f"Transcription failed (session {session_key}): {e}")
+        finally:
+            _transcription_queue.task_done()
+
+
+async def _handle_transcribe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    action, session_key = query.data.split(":", 1)
+
+    if action == "transcribe":
+        mp4_path = _pending_transcriptions.pop(session_key, None)
+        if not mp4_path:
+            await query.edit_message_text(query.message.text + "\n\n⚠️ Request expired.")
+            return
+        was_empty = _transcription_queue.empty()
+        await _transcription_queue.put((mp4_path, query.message.chat_id, session_key))
+        status = "Starting now…" if was_empty else f"Queued (position {_transcription_queue.qsize()})"
+        await query.edit_message_text(query.message.text + f"\n\nTranscription: {status}")
+
+    elif action == "skip":
+        _pending_transcriptions.pop(session_key, None)
+        await query.edit_message_text(query.message.text + "\n\nTranscription skipped.")
 
 
 def is_authorized(user_id: int) -> bool:
@@ -90,8 +134,10 @@ async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Already recording this meeting.")
         return
 
+    username = (user.username or user.first_name or str(user_id)).replace(" ", "_")
     store.set_pending(user_id, {
         "url": url,
+        "username": username,
         "guest_name": DEFAULT_GUEST_NAME,
         "prefix": None,
         "resolution": "1080p",
@@ -272,6 +318,7 @@ def _cancel_timeout(user_id: int) -> None:
 async def _start_recording(user_id: int, chat_id: int, bot) -> None:
     p = store.pop_pending(user_id)
     url = p.get("url")
+    username = p.get("username", str(user_id))
     guest_name = p.get("guest_name", DEFAULT_GUEST_NAME)
     prefix = p.get("prefix")
     resolution = p.get("resolution", "1080p")
@@ -295,17 +342,27 @@ async def _start_recording(user_id: int, chat_id: int, bot) -> None:
     )
 
     async def on_started(filename: str) -> None:
+        folder = Path(filename).parent.name
         await bot.send_message(
             chat_id,
-            f"Recording started — Session {session_num}\nFile: {filename}",
+            f"Recording started — Session {session_num}\nFolder: {folder}",
         )
 
     async def on_stopped(filename: str, duration: str, size: str, auto_ended: bool = False) -> None:
+        folder = Path(filename).parent.name
         reason = "Meeting ended by host" if auto_ended else "Stopped manually"
+        session_key = str(session_num)
+        _pending_transcriptions[session_key] = filename
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Transcribe", callback_data=f"transcribe:{session_key}"),
+            InlineKeyboardButton("Skip",       callback_data=f"skip:{session_key}"),
+        ]])
         await bot.send_message(
             chat_id,
             f"Recording saved — Session {session_num}\n"
-            f"File: {filename}\nDuration: {duration}\nSize: {size}\nReason: {reason}",
+            f"Folder: {folder}\nDuration: {duration}\nSize: {size}\nReason: {reason}\n\n"
+            f"Transcribe with Whisper?",
+            reply_markup=keyboard,
         )
 
     async def on_error(msg: str) -> None:
@@ -314,6 +371,7 @@ async def _start_recording(user_id: int, chat_id: int, bot) -> None:
     recorder = ZoomRecorder(
         display=display_str,
         sink=sink_monitor,
+        username=username,
         guest_name=guest_name,
         recording_prefix=prefix,
         resolution=resolution,
@@ -429,7 +487,7 @@ async def cmd_ongoing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         r = s.recorder
         name = html.escape(r.recording_prefix or "auto")
         url = html.escape(r.current_url or "—")
-        fname = html.escape(r.output_path.name if r.output_path else "—")
+        fname = html.escape(r.output_path.parent.name if r.output_path else "—")
         lines.append(
             f"🔴 <b>Session {s.session_num} — {name}</b>\n"
             f"Duration: {r.elapsed_str()} | Size: {r.file_size_str()}\n"
@@ -467,8 +525,12 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.exception("Unhandled exception in handler", exc_info=context.error)
 
 
+async def _post_init(application: Application) -> None:
+    asyncio.create_task(_transcription_worker(application.bot))
+
+
 def main() -> None:
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
     app.add_error_handler(_error_handler)
     app.add_handler(CommandHandler("record", cmd_record))
     app.add_handler(CommandHandler("stop", cmd_stop))
@@ -482,7 +544,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_resolution,          pattern="^resolution_(360p|720p|1080p)$"))
     app.add_handler(CallbackQueryHandler(cb_stop_session,        pattern=r"^stop_session_(\d+)$"))
     app.add_handler(CallbackQueryHandler(cb_stop_all,            pattern="^stop_all_sessions$"))
-    app.add_handler(CallbackQueryHandler(cb_cancel_stop,         pattern="^cancel_stop$"))
+    app.add_handler(CallbackQueryHandler(cb_cancel_stop,              pattern="^cancel_stop$"))
+    app.add_handler(CallbackQueryHandler(_handle_transcribe_callback, pattern=r"^(transcribe|skip):"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
     logger.info("Zoomy bot started (@baboonrecord_bot)")
     app.run_polling(drop_pending_updates=True)
