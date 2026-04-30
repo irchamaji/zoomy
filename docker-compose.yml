@@ -7,15 +7,3 @@ services:
     volumes:
       - ./recordings:/recordings
     shm_size: "2gb"
-
-  filebrowser:
-    image: filebrowser/filebrowser:latest
-    container_name: zoomy-files
-    restart: unless-stopped
-    ports:
-      - "7010:80"
-    volumes:
-      - ./recordings:/srv
-      - ./filebrowser/filebrowser.db:/database.db
-    command: -d /database.db -r /srv
-    user: "0:0"
