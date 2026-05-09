@@ -133,23 +133,23 @@ class ZoomRecorder:
         self,
         display: str = ":99",
         sink: str = "virtual.monitor",
-        username: str = "user",
         guest_name: str = GUEST_NAME,
         recording_prefix: Optional[str] = None,
         resolution: str = "1080p",
         on_started: Optional[Callback] = None,
         on_stopped: Optional[Callback] = None,
         on_error: Optional[Callback] = None,
+        on_dialog: Optional[Callback] = None,
     ):
         self.display = display
         self.sink = sink
-        self.username = username
         self.guest_name = guest_name
         self.recording_prefix = recording_prefix
         self.resolution = resolution
         self.on_started = on_started
         self.on_stopped = on_stopped
         self.on_error = on_error
+        self.on_dialog = on_dialog
         self.is_recording = False
         self.current_url: Optional[str] = None
         self.output_path: Optional[Path] = None
@@ -157,6 +157,7 @@ class ZoomRecorder:
         self._auto_ended = False
         self._ffmpeg: Optional[subprocess.Popen] = None
         self._stop_event = asyncio.Event()
+        self._dialog_pending: bool = False
 
     def elapsed_str(self) -> str:
         if self._start_time is None:
@@ -191,7 +192,7 @@ class ZoomRecorder:
             if not self.recording_prefix:
                 self.recording_prefix = randomname.get_name()
             datestamp = datetime.now().strftime("%Y%m%d")
-            folder_stem = f"{self.username}_{self.recording_prefix}_{datestamp}"
+            folder_stem = f"{self.recording_prefix}_{datestamp}"
             recording_dir = RECORDINGS_DIR / folder_stem
             recording_dir.mkdir(parents=True, exist_ok=True)
             self.output_path = recording_dir / f"{self.recording_prefix}.mp4"
@@ -299,6 +300,62 @@ class ZoomRecorder:
                     pass
         except Exception:
             pass
+
+    async def _dismiss_blocking_dialogs(self, page: Page) -> None:
+        """Detect any blocking modal with an OK-type button, notify, and dismiss it."""
+        if self._dialog_pending:
+            return
+        JS = """
+            (() => {
+                const OK_LABELS = ['ok', 'got it', 'i understand', 'accept', 'dismiss', 'continue'];
+
+                // Pass 1: modal/dialog containers
+                const containers = document.querySelectorAll(
+                    '[role="dialog"], [role="alertdialog"], '
+                    + '[class*="modal"], [class*="dialog"], [class*="overlay"], [class*="popup"]'
+                );
+                for (const el of containers) {
+                    if (el.offsetParent === null) continue;
+                    for (const btn of el.querySelectorAll('button')) {
+                        const txt = (btn.textContent || btn.getAttribute('aria-label') || '')
+                                    .trim().toLowerCase();
+                        if (OK_LABELS.includes(txt) && btn.offsetParent !== null) {
+                            const text = el.innerText.trim();
+                            btn.click();
+                            return text;
+                        }
+                    }
+                }
+
+                // Pass 2: notification banners / top bars (not inside a dialog container)
+                for (const btn of document.querySelectorAll('button')) {
+                    const txt = (btn.textContent || btn.getAttribute('aria-label') || '')
+                                .trim().toLowerCase();
+                    if (txt === 'ok' && btn.offsetParent !== null) {
+                        const container = btn.closest('[class]');
+                        const text = (container?.innerText || btn.parentElement?.innerText || 'notification').trim();
+                        btn.click();
+                        return text;
+                    }
+                }
+
+                return null;
+            })()
+        """
+        try:
+            self._dialog_pending = True
+            dialog_text = await page.evaluate(JS)
+            if dialog_text:
+                logger.info("Dismissed blocking dialog: %s", dialog_text[:80])
+                if self.on_dialog:
+                    try:
+                        await self.on_dialog(dialog_text)
+                    except Exception:
+                        logger.exception("on_dialog callback failed")
+        except Exception as e:
+            logger.warning("_dismiss_blocking_dialogs failed: %s", e)
+        finally:
+            self._dialog_pending = False
 
     async def _join_meeting(self, page: Page, web_url: str) -> None:
         await page.goto(web_url, wait_until="domcontentloaded", timeout=30_000)
@@ -433,6 +490,7 @@ class ZoomRecorder:
                     return
             except Exception:
                 pass
+            await self._dismiss_blocking_dialogs(page)
             await asyncio.sleep(3)
 
     _RESOLUTION_SCALE = {

@@ -16,19 +16,36 @@ Zoomy uses Playwright to join a Zoom web client session on a virtual display (Xv
 
 ## Bot commands
 
+### BotFather `/setcommands`
+
+```
+record - Start recording a Zoom meeting
+stop - Stop the active recording
+peek - Screenshot of the active meeting screen
+schedule - View and cancel scheduled recordings
+ongoing - Show active recordings
+status - Active count + total across all users
+```
+
+### Command reference
+
 | Command | Description |
 |---------|-------------|
-| `/record <zoom_url>` | Start recording a Zoom meeting |
+| `/record [zoom_url]` | Start recording a Zoom meeting |
 | `/stop` | Stop the active recording |
+| `/peek` | Screenshot of the active meeting screen |
+| `/schedule` | View and cancel scheduled recordings |
 | `/ongoing` | Show active recordings with duration, size, URL |
 | `/status` | Your active count + total across all users |
 
 ### `/record` flow
 
-1. **Bot name** — change the display name for this session, or use the default
-2. **Recording name** — type a label (used as filename prefix), or skip for auto-name
-3. **Resolution** — `[360p]` `[720p]` `[1080p]`
-4. Bot joins meeting muted + camera off → recording starts
+1. **URL** — pass inline (`/record <url>`) or send after the prompt (100s timeout → cancelled)
+2. **Bot name** — change the display name, or use the default (100s timeout → auto-selects default)
+3. **Recording name** — type a label used as filename prefix, or skip (100s timeout → auto-name)
+4. **Resolution** — `[360p]` `[720p]` `[1080p]` (100s timeout → 1080p)
+5. **Start now or schedule** — start immediately, or pick a future date/time in WIB (UTC+7)
+6. Bot joins meeting muted + camera off → recording starts
 
 Multiple concurrent recordings are supported. Each session gets its own isolated display and audio sink. Per-user isolation: each authorized user manages only their own sessions.
 
@@ -103,9 +120,18 @@ You can also access recordings directly from the `recordings/` bind mount.
 ## Recording filename format
 
 ```
-{name}_{YYYYMMDD}_{HHMMSS}_{meetingId}.mp4   # named session
-{YYYYMMDD}_{HHMMSS}_{meetingId}.mp4            # auto-named session
+{name}_{YYYYMMDD}/          # named session   → folder + MP4 inside
+{randomname}_{YYYYMMDD}/    # auto-named session
 ```
+
+## Planned features
+
+- **`/files`** — list recordings directly in Telegram with size and date; download small files without needing FileBrowser
+- **Auto-cleanup** — automatically delete recordings older than a configurable number of days
+- **Transcript summary** — after Whisper transcription, generate a summary via Ollama or an LLM API with a custom prompt
+- **Transcript via Telegram** — send the `.txt` transcript file directly in chat after transcription
+- **Transcript translation** — translate the transcript to another language after transcription
+- **Edit scheduled recording** — reschedule a pending session without redoing the full setup flow
 
 ## Notes
 
