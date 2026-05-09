@@ -2,6 +2,16 @@
 
 A Telegram bot that records Zoom meetings by joining as a browser guest — no Zoom account or host access required.
 
+## Demo
+
+**Bot flow** (`/record` → schedule → join → stop)
+
+https://github.com/irchamaji/zoomy/raw/main/demo-howto.mp4
+
+**Recording output sample**
+
+![Recording output sample](demo-output.png)
+
 ## How it works
 
 Zoomy uses Playwright to join a Zoom web client session on a virtual display (Xvfb), then captures the screen and audio with FFmpeg.
