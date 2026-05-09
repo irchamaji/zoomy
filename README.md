@@ -6,7 +6,7 @@ A Telegram bot that records Zoom meetings by joining as a browser guest — no Z
 
 **Bot flow** (`/record` → schedule → join → stop)
 
-![Bot flow demo](demo-howto.gif)
+![Bot flow](demo-howto.gif)
 
 **Recording output sample**
 
