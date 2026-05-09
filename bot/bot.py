@@ -338,7 +338,7 @@ async def _rec_name_timeout(user_id: int, bot) -> None:
     if store.get_pending(user_id).get("state") == "input_rec_name":
         store.update_pending(user_id, state=None)
         await bot.send_message(user_id, "No response — using auto-name.")
-        await _ask_resolution(user_id, bot)
+        await _ask_start_or_schedule(user_id, bot)
 
 
 async def cb_skip_rec_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -352,7 +352,7 @@ async def cb_skip_rec_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     _cancel_timeout(user_id)
     store.update_pending(user_id, state=None)
     await query.edit_message_text("Using auto-name.")
-    await _ask_resolution(user_id, context.bot)
+    await _ask_start_or_schedule(user_id, context.bot)
 
 
 # ── Message router ────────────────────────────────────────────────────────────
@@ -399,7 +399,7 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         _cancel_timeout(user_id)
         store.update_pending(user_id, state=None, prefix=prefix)
         await update.message.reply_text(f"Recording name: {prefix}")
-        await _ask_resolution(user_id, context.bot)
+        await _ask_start_or_schedule(user_id, context.bot)
 
     elif state == "input_schedule_time":
         text = update.message.text.strip()
@@ -460,49 +460,10 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"✅ Scheduled!\n\n"
             f"🕐 {time_str}\n"
             f"📝 Recording: {html.escape(description)}\n"
-            f"👤 Bot name: {html.escape(p.get('guest_name', DEFAULT_GUEST_NAME))}\n"
-            f"📺 Resolution: {p.get('resolution', '1080p')}",
+            f"👤 Bot name: {html.escape(p.get('guest_name', DEFAULT_GUEST_NAME))}",
             reply_markup=kb,
         )
 
-
-# ── Resolution step ───────────────────────────────────────────────────────────
-
-async def _ask_resolution(user_id: int, bot) -> None:
-    _cancel_timeout(user_id)
-    store.update_pending(user_id, state="waiting_resolution")
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("360p", callback_data="resolution_360p"),
-        InlineKeyboardButton("720p", callback_data="resolution_720p"),
-        InlineKeyboardButton("1080p", callback_data="resolution_1080p"),
-    ]])
-    await bot.send_message(user_id, "Select recording resolution: (auto 1080p in 100s)", reply_markup=kb)
-    task = asyncio.create_task(_resolution_timeout(user_id, bot))
-    store.update_pending(user_id, timeout_task=task)
-
-
-async def _resolution_timeout(user_id: int, bot) -> None:
-    await asyncio.sleep(100)
-    if store.get_pending(user_id).get("state") == "waiting_resolution":
-        store.update_pending(user_id, resolution="1080p", state=None)
-        await bot.send_message(user_id, "No response — using 1080p.")
-        await _ask_start_or_schedule(user_id, bot)
-
-
-async def cb_resolution(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-
-    if not store.has_pending(user_id):
-        await query.edit_message_text("Session expired. Start again with /record.")
-        return
-
-    _cancel_timeout(user_id)
-    resolution = query.data.split("_", 1)[1]
-    store.update_pending(user_id, resolution=resolution, state=None)
-    await query.edit_message_text(f"Resolution: {resolution}")
-    await _ask_start_or_schedule(user_id, context.bot)
 
 
 async def _ask_start_or_schedule(user_id: int, bot) -> None:
@@ -1046,7 +1007,6 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_use_default,         pattern="^use_default$"))
     app.add_handler(CallbackQueryHandler(cb_change_name,         pattern="^change_name$"))
     app.add_handler(CallbackQueryHandler(cb_skip_rec_name,       pattern="^skip_rec_name$"))
-    app.add_handler(CallbackQueryHandler(cb_resolution,          pattern="^resolution_(360p|720p|1080p)$"))
     app.add_handler(CallbackQueryHandler(cb_peek_session,        pattern=r"^peek_session_(\d+)$"))
     app.add_handler(CallbackQueryHandler(cb_peek_all,            pattern="^peek_all_sessions$"))
     app.add_handler(CallbackQueryHandler(cb_stop_session,        pattern=r"^stop_session_(\d+)$"))

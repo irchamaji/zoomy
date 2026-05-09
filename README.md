@@ -43,9 +43,8 @@ status - Active count + total across all users
 1. **URL** — pass inline (`/record <url>`) or send after the prompt (100s timeout → cancelled)
 2. **Bot name** — change the display name, or use the default (100s timeout → auto-selects default)
 3. **Recording name** — type a label used as filename prefix, or skip (100s timeout → auto-name)
-4. **Resolution** — `[360p]` `[720p]` `[1080p]` (100s timeout → 1080p)
-5. **Start now or schedule** — start immediately, or pick a future date/time in WIB (UTC+7)
-6. Bot joins meeting muted + camera off → recording starts
+4. **Start now or schedule** — start immediately, or pick a future date/time in WIB (UTC+7)
+5. Bot joins meeting muted + camera off → recording starts at 1080p
 
 Multiple concurrent recordings are supported. Each session gets its own isolated display and audio sink. Per-user isolation: each authorized user manages only their own sessions.
 
@@ -132,6 +131,23 @@ You can also access recordings directly from the `recordings/` bind mount.
 - **Transcript via Telegram** — send the `.txt` transcript file directly in chat after transcription
 - **Transcript translation** — translate the transcript to another language after transcription
 - **Edit scheduled recording** — reschedule a pending session without redoing the full setup flow
+
+## Recording crop
+
+Each session runs on a **1920×1200 virtual display** (Xvfb). The extra 120px of vertical space gives the browser chrome (address bar, tab bar) room to exist without eating into the meeting content.
+
+After joining the meeting, the bot measures the browser chrome height once via JavaScript:
+
+```js
+window.outerHeight - window.innerHeight  // e.g. 90px
+```
+
+FFmpeg then starts with a `-vf crop=1920:{h}:0:{chrome_height}` filter baked in — applied live, frame-by-frame from the first second. The saved MP4 already has the chrome stripped; no post-processing pass is needed.
+
+Example: chrome = 90px → `crop=1920:1110:0:90` → output is 1920×1110  
+Example: chrome = 120px → `crop=1920:1080:0:120` → output is 1920×1080
+
+Output is always ~1080p tall (exact height depends on the measured chrome), width stays 1920px.
 
 ## Notes
 

@@ -72,7 +72,7 @@ class DisplayPool:
                     proc = subprocess.Popen(
                         [
                             "Xvfb", f":{n}",
-                            "-screen", "0", "1920x1080x24",
+                            "-screen", "0", "1920x1200x24",
                             "-ac", "+extension", "GLX", "+render", "-noreset",
                         ],
                         stdout=subprocess.DEVNULL,
@@ -213,7 +213,7 @@ class ZoomRecorder:
                         "--autoplay-policy=no-user-gesture-required",
                         "--disable-blink-features=AutomationControlled",
                         "--start-maximized",
-                        "--window-size=1920,1080",
+                        "--window-size=1920,1200",
                     ],
                 )
                 ctx = await browser.new_context(
@@ -224,7 +224,17 @@ class ZoomRecorder:
 
                 await self._join_meeting(page, web_url)
 
-                self._ffmpeg = self._start_ffmpeg(str(self.output_path))
+                # Measure browser chrome height for cropping
+                try:
+                    chrome_height = await page.evaluate(
+                        "window.outerHeight - window.innerHeight"
+                    )
+                    chrome_height = max(0, int(chrome_height))
+                except Exception:
+                    chrome_height = 0
+                logger.info("Browser chrome height: %dpx", chrome_height)
+
+                self._ffmpeg = self._start_ffmpeg(str(self.output_path), chrome_height)
                 logger.info("FFmpeg started → %s", self.output_path)
 
                 if self.on_started:
@@ -499,18 +509,34 @@ class ZoomRecorder:
         "1080p": None,
     }
 
-    def _start_ffmpeg(self, output: str) -> subprocess.Popen:
-        scale = self._RESOLUTION_SCALE.get(self.resolution)
+    def _build_vf(self, chrome_height: int) -> Optional[str]:
+        """Build -vf filter string.
+
+        Display is 1920×1200. Browser chrome sits at the top (chrome_height px).
+        Crop away the chrome rows; output width stays 1920, height is whatever
+        remains (rounded down to even for H.264 — typically ~1080–1200px).
+        """
+        crop_y = max(0, chrome_height)
+        out_h = 1200 - crop_y
+        out_h -= out_h % 2  # H.264 requires even dimensions
+        if out_h <= 0:
+            crop_y = 0
+            out_h = 1200
+        logger.info("Crop filter: 1920x%d at y=%d (chrome=%dpx)", out_h, crop_y, chrome_height)
+        return f"crop=1920:{out_h}:0:{crop_y}" if crop_y > 0 else None
+
+    def _start_ffmpeg(self, output: str, chrome_height: int = 0) -> subprocess.Popen:
         cmd = [
             "ffmpeg", "-y",
             "-loglevel", "warning", "-nostats",
-            "-f", "x11grab", "-r", "25", "-s", "1920x1080", "-i", self.display,
+            "-f", "x11grab", "-r", "25", "-s", "1920x1200", "-i", self.display,
             "-f", "pulse", "-i", self.sink,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
             "-pix_fmt", "yuv420p",
         ]
-        if scale:
-            cmd += ["-vf", f"scale={scale}"]
+        vf = self._build_vf(chrome_height)
+        if vf:
+            cmd += ["-vf", vf]
         cmd += [
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
