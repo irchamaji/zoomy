@@ -6,6 +6,8 @@ import json
 import logging
 import logging.handlers
 import os
+import re
+import secrets
 import subprocess
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -23,6 +25,7 @@ from telegram.ext import (
 )
 
 import transcriber as transcriber_mod
+import summarizer as summarizer_mod
 
 from recorder import ZoomRecorder, _display_pool
 from store import RecordingSession, SessionStore
@@ -108,7 +111,34 @@ def _remove_from_schedule_file(sched_id: int) -> None:
 store = SessionStore()
 
 _transcription_queue: asyncio.Queue = asyncio.Queue()
+_transcription_busy: bool = False          # True while worker is actively transcribing
 _pending_transcriptions: dict[str, str] = {}  # session_key → mp4_path
+_pending_send_transcript: dict[str, str] = {}  # token → txt_path
+_pending_summarize_txt: dict[str, str] = {}   # token → txt_path
+_pending_summary_context: dict[int, dict] = {}
+# {user_id: {txt_path, folder_name, chat_id, prompt_msg_id, timeout_task}}
+
+_reschedule_state: dict[int, dict] = {}
+# {user_id: {sched_id, chat_id, confirm_msg_id, pending_dt, timeout_task}}
+
+_RENAME_FORBIDDEN = set('/\\:*?"<>|')  # chars not allowed in folder names
+
+
+def _queue_status_str() -> str:
+    """Call after put()-ing an item. Returns human-readable position."""
+    qs = _transcription_queue.qsize()
+    if not _transcription_busy and qs == 1:
+        return "Starting now…"
+    return f"Queued — #{qs} in line"
+
+
+def _extract_file_prefix(folder_name: str) -> str:
+    """Return the file stem used inside a recording folder.
+    Strips a trailing _YYYYMMDD suffix if present, otherwise returns the full name.
+    e.g. 'standup_20250512' → 'standup', 'my-meeting' → 'my-meeting'
+    """
+    m = re.match(r'^(.+)_\d{8}$', folder_name)
+    return m.group(1) if m else folder_name
 
 # ── Scheduled recordings ──────────────────────────────────────────────────────
 
@@ -126,19 +156,50 @@ _sched_counter: int = 0
 
 
 async def _transcription_worker(bot) -> None:
+    global _transcription_busy
     while True:
-        mp4_path, chat_id, session_key = await _transcription_queue.get()
-        await bot.send_message(chat_id, f"Transcribing session {session_key}…")
+        mp4_path, chat_id, session_key, model = await _transcription_queue.get()
+        _transcription_busy = True
+        is_retranscribe = session_key.startswith("retranscribe/")
+        label = session_key[len("retranscribe/"):] if is_retranscribe else f"Session {session_key}"
+        verb = "Retranscribing" if is_retranscribe else "Transcribing"
+        await bot.send_message(chat_id, f"{verb} {label} ({model})…")
         try:
-            txt, srt = await transcriber_mod.transcribe(mp4_path, WHISPER_MODEL, WHISPER_LANGUAGE)
-            name = Path(txt).stem
+            txt, srt = await transcriber_mod.transcribe(mp4_path, model, WHISPER_LANGUAGE)
+            txt_obj = Path(txt)
+
+            # Update .metadata.json with transcript info
+            meta_path = txt_obj.parent / ".metadata.json"
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    meta["transcript"] = {
+                        "model": model,
+                        "transcribed_at": datetime.now().isoformat(),
+                    }
+                    meta_path.write_text(
+                        json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
+                    )
+                except Exception:
+                    logger.warning("Could not update metadata after transcription")
+
+            token_send = secrets.token_hex(8)
+            _pending_send_transcript[token_send] = str(txt_obj)
+            done_verb = "Retranscription done" if is_retranscribe else "Transcript saved"
+            kb_rows = [[InlineKeyboardButton("📄 Send Transcript", callback_data=f"send_txt:{token_send}")]]
+            if summarizer_mod.is_configured():
+                token_sum = secrets.token_hex(8)
+                _pending_summarize_txt[token_sum] = str(txt_obj)
+                kb_rows.append([InlineKeyboardButton("🤖 AI Summary", callback_data=f"summarize_txt:{token_sum}")])
             await bot.send_message(
                 chat_id,
-                f"Transcript saved — Session {session_key}\n  {name}.txt\n  {name}.srt",
+                f"✅ {done_verb} — {label} ({model})\n  {txt_obj.stem}.txt\n  {txt_obj.stem}.srt",
+                reply_markup=InlineKeyboardMarkup(kb_rows),
             )
         except Exception as e:
-            await bot.send_message(chat_id, f"Transcription failed (session {session_key}): {e}")
+            await bot.send_message(chat_id, f"Transcription failed ({label}): {e}")
         finally:
+            _transcription_busy = False
             _transcription_queue.task_done()
 
 
@@ -146,10 +207,11 @@ async def _transcribe_timeout(session_key: str, mp4_path: str, chat_id: int, bot
     await asyncio.sleep(100)
     if session_key in _pending_transcriptions:
         _pending_transcriptions.pop(session_key)
-        was_empty = _transcription_queue.empty()
-        await _transcription_queue.put((mp4_path, chat_id, session_key))
-        status = "Starting now…" if was_empty else f"Queued (position {_transcription_queue.qsize()})"
-        await bot.send_message(chat_id, f"Auto-transcribing session {session_key}. {status}")
+        await _transcription_queue.put((mp4_path, chat_id, session_key, "medium"))
+        await bot.send_message(
+            chat_id,
+            f"Auto-transcribing session {session_key} (medium). {_queue_status_str()}"
+        )
 
 
 async def _handle_transcribe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -157,19 +219,48 @@ async def _handle_transcribe_callback(update: Update, context: ContextTypes.DEFA
     await query.answer()
     action, session_key = query.data.split(":", 1)
 
-    if action == "transcribe":
+    if action in ("transcribe_medium", "transcribe_large"):
         mp4_path = _pending_transcriptions.pop(session_key, None)
         if not mp4_path:
             await query.edit_message_text(query.message.text + "\n\n⚠️ Request expired.")
             return
-        was_empty = _transcription_queue.empty()
-        await _transcription_queue.put((mp4_path, query.message.chat_id, session_key))
-        status = "Starting now…" if was_empty else f"Queued (position {_transcription_queue.qsize()})"
-        await query.edit_message_text(query.message.text + f"\n\nTranscription: {status}")
+        model = "medium" if action == "transcribe_medium" else "large-v3"
+        await _transcription_queue.put((mp4_path, query.message.chat_id, session_key, model))
+        await query.edit_message_text(
+            query.message.text + f"\n\nTranscription ({model}): {_queue_status_str()}"
+        )
 
     elif action == "skip":
         _pending_transcriptions.pop(session_key, None)
         await query.edit_message_text(query.message.text + "\n\nTranscription skipped.")
+
+
+async def cb_send_txt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    token = query.data.split(":", 1)[1]
+    txt_path = _pending_send_transcript.pop(token, None)
+    if not txt_path or not Path(txt_path).exists():
+        await query.edit_message_text(query.message.text + "\n\n⚠️ File not found or already sent.")
+        return
+    try:
+        with open(txt_path, "rb") as f:
+            await context.bot.send_document(
+                query.message.chat_id, document=f, filename=Path(txt_path).name
+            )
+        if summarizer_mod.is_configured():
+            token_sum = secrets.token_hex(8)
+            _pending_summarize_txt[token_sum] = txt_path
+            await query.edit_message_text(
+                query.message.text + "\n\n📄 Sent.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🤖 AI Summary", callback_data=f"summarize_txt:{token_sum}"),
+                ]]),
+            )
+        else:
+            await query.edit_message_text(query.message.text + "\n\n📄 Sent.")
+    except Exception as e:
+        await query.edit_message_text(query.message.text + f"\n\n⚠️ Failed to send: {e}")
 
 
 def is_authorized(user_id: int) -> bool:
@@ -362,6 +453,23 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     user_id = update.effective_user.id
+
+    # Reschedule input takes priority over everything
+    if user_id in _reschedule_state:
+        await _handle_reschedule_input(update, context)
+        return
+
+    # Rename input (sub-state inside history session)
+    hist = _history_state.get(user_id)
+    if hist and hist.get("sub_state") == "input_rename":
+        await _handle_rename_input(update, context)
+        return
+
+    # AI Summary context input
+    if user_id in _pending_summary_context:
+        await _handle_summary_context_input(update, context)
+        return
+
     state = store.get_pending(user_id).get("state")
 
     if state == "input_url":
@@ -565,14 +673,15 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
         session_key = str(session_num)
         _pending_transcriptions[session_key] = filename
         keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("Transcribe", callback_data=f"transcribe:{session_key}"),
-            InlineKeyboardButton("Skip",       callback_data=f"skip:{session_key}"),
+            InlineKeyboardButton("🎙 Medium", callback_data=f"transcribe_medium:{session_key}"),
+            InlineKeyboardButton("🎙 Large",  callback_data=f"transcribe_large:{session_key}"),
+            InlineKeyboardButton("Skip",      callback_data=f"skip:{session_key}"),
         ]])
         await bot.send_message(
             chat_id,
             f"Recording saved — Session {session_num}\n"
             f"Folder: {folder}\nDuration: {duration}\nSize: {size}\nReason: {reason}\n\n"
-            f"Transcribe with Whisper? (auto-transcribing in 100s)",
+            f"Transcribe with Whisper? (auto-transcribes with Medium in 100s)",
             reply_markup=keyboard,
         )
         asyncio.create_task(_transcribe_timeout(session_key, filename, chat_id, bot))
@@ -672,10 +781,10 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     for s in pending:
         time_str = s.scheduled_time.strftime("%a %d %b at %H:%M WIB")
         lines.append(f"• #{s.sched_id} — {html.escape(s.description)} @ {time_str}")
-        buttons.append([InlineKeyboardButton(
-            f"❌ Cancel #{s.sched_id} ({time_str})",
-            callback_data=f"cancel_schedule_{s.sched_id}",
-        )])
+        buttons.append([
+            InlineKeyboardButton("🔄 Reschedule", callback_data=f"reschedule_{s.sched_id}"),
+            InlineKeyboardButton("❌ Cancel",      callback_data=f"cancel_schedule_{s.sched_id}"),
+        ])
     await update.message.reply_text(
         "Scheduled recordings:\n" + "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -701,6 +810,181 @@ async def cb_cancel_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(f"❌ Cancelled: #{sched_id} — {html.escape(sched.description)} @ {time_str}")
 
 
+async def cb_reschedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    sched_id = int(re.search(r"\d+", query.data).group())
+
+    user_scheds = _scheduled.get(user_id, [])
+    sched = next((s for s in user_scheds if s.sched_id == sched_id), None)
+    if not sched or sched.task.done():
+        await query.edit_message_text(query.message.text + "\n\n⚠️ Already fired or cancelled.")
+        return
+
+    _reschedule_state[user_id] = {
+        "sched_id": sched_id,
+        "chat_id": query.message.chat_id,
+        "confirm_msg_id": query.message.message_id,
+        "pending_dt": None,
+        "timeout_task": None,
+    }
+    time_str = sched.scheduled_time.strftime("%a %d %b at %H:%M WIB")
+    await query.edit_message_text(
+        f"🔄 Rescheduling: <b>{html.escape(sched.description)}</b>\n"
+        f"Current time: {time_str}\n\n"
+        f"Send the new date/time: (100s timeout)",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Abort", callback_data="reschedule_abort"),
+        ]]),
+    )
+    _reset_reschedule_timeout(user_id, context.bot, query.message.chat_id, query.message.message_id)
+
+
+async def _handle_reschedule_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    state = _reschedule_state.get(user_id)
+    if not state:
+        return
+
+    text = update.message.text.strip()
+    dt = dateparser_lib.parse(text, settings=DATEPARSER_SETTINGS)
+    if not dt:
+        await update.message.reply_text(
+            "Couldn't understand that time. Try:\n"
+            "`tomorrow 14:00` · `in 2 hours` · `May 15 09:30`",
+            parse_mode="Markdown",
+        )
+        return  # keep state + timeout running
+
+    if (dt - datetime.now(timezone.utc)).total_seconds() <= 0:
+        await update.message.reply_text("That time is already in the past. Try again.")
+        return  # keep state + timeout running
+
+    dt_wib = dt.astimezone(WIB)
+    time_str = dt_wib.strftime("%A, %d %b %Y at %H:%M WIB")
+    state["pending_dt"] = dt
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Confirm", callback_data="reschedule_confirm"),
+        InlineKeyboardButton("✏️ Change",  callback_data="reschedule_change"),
+    ], [
+        InlineKeyboardButton("❌ Abort", callback_data="reschedule_abort"),
+    ]])
+    try:
+        await context.bot.edit_message_text(
+            chat_id=state["chat_id"],
+            message_id=state["confirm_msg_id"],
+            text=f"🕐 New time: <b>{html.escape(time_str)}</b>\n\nConfirm?",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    except Exception:
+        msg = await update.message.reply_text(
+            f"🕐 New time: <b>{html.escape(time_str)}</b>\n\nConfirm?",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        state["confirm_msg_id"] = msg.message_id
+        state["chat_id"] = update.effective_chat.id
+    _reset_reschedule_timeout(user_id, context.bot, state["chat_id"], state["confirm_msg_id"])
+
+
+async def cb_reschedule_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    _cancel_reschedule_timeout(user_id)
+    state = _reschedule_state.pop(user_id, None)
+    if not state or not state.get("pending_dt"):
+        await query.edit_message_text("Session expired.")
+        return
+
+    sched_id = state["sched_id"]
+    dt = state["pending_dt"]
+
+    entries = _read_schedule_file()
+    entry = next((e for e in entries if e["sched_id"] == sched_id), None)
+    user_scheds = _scheduled.get(user_id, [])
+    sched = next((s for s in user_scheds if s.sched_id == sched_id), None)
+
+    if not sched or sched.task.done() or not entry:
+        await query.edit_message_text("⚠️ That recording already fired or was cancelled.")
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    delay = (dt - now_utc).total_seconds()
+    if delay <= 0:
+        await query.edit_message_text("⚠️ That time has already passed. Use /schedule to try again.")
+        return
+
+    dt_wib = dt.astimezone(WIB)
+    time_str = dt_wib.strftime("%A, %d %b %Y at %H:%M WIB")
+    p = entry["pending"]
+
+    # Cancel old task and remove from store + file
+    sched.task.cancel()
+    _scheduled[user_id] = [s for s in user_scheds if s.sched_id != sched_id]
+    _remove_from_schedule_file(sched_id)
+
+    # Create new task, reuse same sched_id
+    task = asyncio.create_task(
+        _run_scheduled(sched_id, user_id, sched.chat_id, context.bot, p, delay, dt_wib)
+    )
+    _scheduled.setdefault(user_id, []).append(ScheduledRecording(
+        sched_id=sched_id, user_id=user_id, chat_id=sched.chat_id,
+        scheduled_time=dt_wib, description=sched.description, task=task,
+    ))
+    _add_to_schedule_file({
+        "sched_id": sched_id, "user_id": user_id, "chat_id": sched.chat_id,
+        "scheduled_time": dt.isoformat(), "description": sched.description,
+        "pending": p,
+    })
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_schedule_{sched_id}"),
+    ]])
+    await query.edit_message_text(
+        f"✅ Rescheduled!\n\n"
+        f"🕐 {time_str}\n"
+        f"📝 Recording: {html.escape(sched.description)}",
+        reply_markup=kb,
+    )
+
+
+async def cb_reschedule_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    state = _reschedule_state.get(user_id)
+    if not state:
+        await query.edit_message_text("Session expired.")
+        return
+    sched_id = state["sched_id"]
+    user_scheds = _scheduled.get(user_id, [])
+    sched = next((s for s in user_scheds if s.sched_id == sched_id), None)
+    desc = html.escape(sched.description) if sched else f"#{sched_id}"
+    state["pending_dt"] = None
+    await query.edit_message_text(
+        f"🔄 Rescheduling: <b>{desc}</b>\n\nSend the new date/time: (100s timeout)",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Abort", callback_data="reschedule_abort"),
+        ]]),
+    )
+    _reset_reschedule_timeout(user_id, context.bot, query.message.chat_id, query.message.message_id)
+
+
+async def cb_reschedule_abort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    _cancel_reschedule_timeout(user_id)
+    _reschedule_state.pop(user_id, None)
+    await query.edit_message_text("Rescheduling aborted.")
+
+
 # ── /peek ─────────────────────────────────────────────────────────────────────
 
 async def _send_peek(session: RecordingSession, chat_id: int, bot) -> None:
@@ -724,9 +1008,11 @@ async def _send_peek(session: RecordingSession, chat_id: int, bot) -> None:
             await bot.send_message(chat_id, f"Session {session.session_num}: screenshot failed.")
             return
         name = html.escape(session.recorder.recording_prefix or "session")
+        url = html.escape(session.recorder.current_url or "—")
         caption = (
             f"📸 Session {session.session_num} — {name}\n"
-            f"⏱ {session.recorder.elapsed_str()} | 💾 {session.recorder.file_size_str()}"
+            f"⏱ {session.recorder.elapsed_str()} | 💾 {session.recorder.file_size_str()}\n"
+            f"🔗 {url}"
         )
         with open(tmp_path, "rb") as f:
             await bot.send_photo(chat_id, photo=f, caption=caption)
@@ -895,6 +1181,917 @@ async def cmd_ongoing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
 
 
+# ── /history ──────────────────────────────────────────────────────────────────
+
+_history_state: dict[int, dict] = {}
+# {user_id: {"folders": [Path,...], "page": int, "selected_folder": Path|None, "selected_file": Path|None}}
+
+_RT_PAGE_SIZE = 10
+_MEDIA_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
+
+
+def _get_recording_folders() -> list[Path]:
+    if not RECORDINGS_DIR.exists():
+        return []
+    folders = [p for p in RECORDINGS_DIR.iterdir() if p.is_dir()]
+    folders.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    return folders
+
+
+def _read_metadata(folder: Path) -> dict:
+    try:
+        p = folder / ".metadata.json"
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _format_duration(seconds) -> str:
+    if not seconds or int(seconds) <= 0:
+        return "—"
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
+
+
+def _folder_display_size(folder: Path) -> str:
+    try:
+        total = sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
+        if total >= 1_073_741_824:
+            return f"{total / 1_073_741_824:.1f}GB"
+        if total >= 1_048_576:
+            return f"{total / 1_048_576:.0f}MB"
+        return f"{total / 1024:.0f}KB"
+    except Exception:
+        return "?"
+
+
+def _file_size_str(path: Path) -> str:
+    try:
+        size = path.stat().st_size
+        if size >= 1_073_741_824:
+            return f"{size / 1_073_741_824:.1f} GB"
+        if size >= 1_048_576:
+            return f"{size / 1_048_576:.0f} MB"
+        return f"{size / 1024:.0f} KB"
+    except Exception:
+        return "?"
+
+
+def _find_media_files(folder: Path) -> list[Path]:
+    try:
+        files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in _MEDIA_EXTS]
+        files.sort(key=lambda f: f.stat().st_size, reverse=True)
+        return files
+    except Exception:
+        return []
+
+
+def _mid_truncate(s: str, max_len: int) -> str:
+    if len(s) <= max_len:
+        return s
+    half = (max_len - 1) // 2
+    return s[:half] + "…" + s[-(max_len - half - 1):]
+
+
+async def _summary_ctx_timeout(user_id: int, bot, chat_id: int, message_id: int) -> None:
+    await asyncio.sleep(120)
+    if _pending_summary_context.pop(user_id, None) is not None:
+        try:
+            await bot.edit_message_text(
+                "⏱ Waktu habis. Tekan 🤖 AI Summary lagi untuk mencoba kembali.",
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+        except Exception:
+            pass
+
+
+def _cancel_summary_ctx_timeout(user_id: int) -> None:
+    state = _pending_summary_context.get(user_id)
+    if not state:
+        return
+    task = state.get("timeout_task")
+    if task and not task.done():
+        task.cancel()
+
+
+async def _history_timeout(user_id: int, bot, chat_id: int, message_id: int) -> None:
+    await asyncio.sleep(100)
+    if _history_state.pop(user_id, None) is not None:
+        try:
+            await bot.edit_message_text(
+                "⏱ Session expired. Use /history to start again.",
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+        except Exception:
+            pass
+
+
+def _reset_history_timeout(user_id: int, bot, chat_id: int, message_id: int) -> None:
+    state = _history_state.get(user_id)
+    if not state:
+        return
+    task = state.get("timeout_task")
+    if task and not task.done():
+        task.cancel()
+    state["timeout_task"] = asyncio.create_task(
+        _history_timeout(user_id, bot, chat_id, message_id)
+    )
+
+
+def _cancel_history_timeout(user_id: int) -> None:
+    state = _history_state.get(user_id)
+    if not state:
+        return
+    task = state.get("timeout_task")
+    if task and not task.done():
+        task.cancel()
+
+
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_authorized(user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+
+    all_folders = _get_recording_folders()
+    # Filter to folders that actually contain media files
+    folders = [f for f in all_folders if _find_media_files(f)]
+    if not folders:
+        await update.message.reply_text("No recordings found.")
+        return
+
+    _history_state[user.id] = {
+        "folders": folders,
+        "page": 0,
+        "selected_folder": None,
+        "selected_file": None,
+        "timeout_task": None,
+    }
+    msg = await update.effective_chat.send_message("Loading…")
+    await _show_history_page(user.id, update.effective_chat.id, context.bot, page=0, edit_msg=msg)
+    _reset_history_timeout(user.id, context.bot, update.effective_chat.id, msg.message_id)
+
+
+async def _show_history_page(user_id: int, chat_id: int, bot, page: int, edit_msg) -> None:
+    state = _history_state.get(user_id)
+    if not state:
+        return
+
+    folders = state["folders"]
+    total = len(folders)
+    start = page * _RT_PAGE_SIZE
+    end = min(start + _RT_PAGE_SIZE, total)
+
+    # Build listing rows (plain text, no <pre>)
+    rows = []
+    for i, idx in enumerate(range(start, end), start=1):
+        try:
+            folder = folders[idx]
+            meta = _read_metadata(folder)
+            media = _find_media_files(folder)
+            size_str = _folder_display_size(folder)
+            dur_str = _format_duration(meta.get("duration_seconds"))
+            has_txt = bool(media) and media[0].with_suffix(".txt").exists()
+            if has_txt:
+                tx_model = meta.get("transcript", {}).get("model", "")
+                tx_label = "Medium TC" if "medium" in tx_model else "Large TC" if tx_model else "TC"
+                tx_str = f"✅ {tx_label}"
+            else:
+                tx_str = "❌ No TC"
+            name = html.escape(folder.name)
+            rows.append(f"<b>{i}.</b> {name}\n    {size_str}  ·  {dur_str}  ·  {tx_str}")
+        except Exception:
+            rows.append(f"<b>{i}.</b> [read error]")
+
+    # Number buttons
+    num_buttons = []
+    row = []
+    for i, idx in enumerate(range(start, end), start=1):
+        row.append(InlineKeyboardButton(str(i), callback_data=f"rt_folder:{idx}"))
+        if len(row) == 5:
+            num_buttons.append(row)
+            row = []
+    if row:
+        num_buttons.append(row)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"rt_page:{page - 1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"rt_page:{page + 1}"))
+    if nav:
+        num_buttons.append(nav)
+    num_buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="rt_cancel")])
+
+    listing = "\n\n".join(rows)
+    text = f"📋 Recordings ({start + 1}–{end} of {total}):\n\n{listing}\n\nSelect number:"
+    markup = InlineKeyboardMarkup(num_buttons)
+    if edit_msg:
+        await edit_msg.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+
+
+async def cb_rt_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    page = int(query.data.split(":")[1])
+
+    if user_id not in _history_state:
+        await query.edit_message_text("Session expired. Use /history to start again.")
+        return
+
+    _history_state[user_id]["page"] = page
+    await _show_history_page(user_id, query.message.chat_id, context.bot, page=page, edit_msg=query.message)
+    _reset_history_timeout(user_id, context.bot, query.message.chat_id, query.message.message_id)
+
+
+async def cb_rt_folder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    idx = int(query.data.split(":")[1])
+
+    state = _history_state.get(user_id)
+    if not state or idx >= len(state["folders"]):
+        await query.edit_message_text("Session expired. Use /history to start again.")
+        return
+
+    folder = state["folders"][idx]
+    state["selected_folder"] = folder
+    media_files = _find_media_files(folder)
+    page = state["page"]
+
+    if not media_files:
+        await query.edit_message_text(
+            f"📁 {html.escape(folder.name)}\n\nNo media files found in this folder.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Back", callback_data=f"rt_page:{page}"),
+                InlineKeyboardButton("❌ Cancel", callback_data="rt_cancel"),
+            ]]),
+        )
+        return
+
+    if len(media_files) == 1:
+        state["selected_file"] = media_files[0]
+        await _show_history_actions(query.message, state)
+        _reset_history_timeout(user_id, context.bot, query.message.chat_id, query.message.message_id)
+        return
+
+    # Multiple media files — let user pick
+    buttons = []
+    for i, f in enumerate(media_files):
+        buttons.append([InlineKeyboardButton(
+            f"🎥 {f.name} ({_file_size_str(f)})",
+            callback_data=f"rt_file:{idx}:{i}",
+        )])
+    buttons.append([
+        InlineKeyboardButton("◀️ Back", callback_data=f"rt_page:{page}"),
+        InlineKeyboardButton("❌ Cancel", callback_data="rt_cancel"),
+    ])
+    await query.edit_message_text(
+        f"📁 {html.escape(folder.name)}\n\nMultiple media files found — select one:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    _reset_history_timeout(user_id, context.bot, query.message.chat_id, query.message.message_id)
+
+
+async def cb_rt_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    _, folder_idx_str, file_idx_str = query.data.split(":")
+
+    state = _history_state.get(user_id)
+    folder_idx = int(folder_idx_str)
+    if not state or folder_idx >= len(state["folders"]):
+        await query.edit_message_text("Session expired. Use /history to start again.")
+        return
+
+    folder = state["folders"][folder_idx]
+    media_files = _find_media_files(folder)
+    file_idx = int(file_idx_str)
+    if file_idx >= len(media_files):
+        await query.edit_message_text("File not found.")
+        return
+
+    state["selected_file"] = media_files[file_idx]
+    await _show_history_actions(query.message, state)
+    _reset_history_timeout(user_id, context.bot, query.message.chat_id, query.message.message_id)
+
+
+async def _show_history_actions(message, state: dict) -> None:
+    f = state["selected_file"]
+    folder = state["selected_folder"]
+    meta = _read_metadata(folder)
+    dur_str = _format_duration(meta.get("duration_seconds"))
+    has_txt = f.with_suffix(".txt").exists()
+
+    has_summary = (folder / ".summary.txt").exists()
+
+    if has_txt:
+        tx_model = meta.get("transcript", {}).get("model", "")
+        tx_note = f"📄 Transcript: {tx_model}" if tx_model else "📄 Transcript exists"
+        sum_note = "  ·  🤖 Summary ✅" if has_summary else ""
+        buttons = [
+            [
+                InlineKeyboardButton("🔄 ReTC (Medium)", callback_data="rt_transcribe:medium"),
+                InlineKeyboardButton("🔄 ReTC (Large)",  callback_data="rt_transcribe:large-v3"),
+            ],
+            [InlineKeyboardButton("📄 Send Transcript", callback_data="rt_send_transcript")],
+        ]
+        if summarizer_mod.is_configured():
+            if has_summary:
+                buttons.append([
+                    InlineKeyboardButton("📋 Send Summary",  callback_data="rt_send_summary"),
+                    InlineKeyboardButton("🔄 Re-summarize", callback_data="rt_resummarize"),
+                ])
+            else:
+                buttons.append([InlineKeyboardButton("🤖 AI Summary", callback_data="rt_summarize")])
+        buttons.append([InlineKeyboardButton("✏️ Rename", callback_data="rt_rename")])
+        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="rt_cancel")])
+    else:
+        tx_note = "No transcript yet"
+        sum_note = ""
+        buttons = [
+            [
+                InlineKeyboardButton("🎙 Transcribe (Medium)", callback_data="rt_transcribe:medium"),
+                InlineKeyboardButton("🎙 Transcribe (Large)",  callback_data="rt_transcribe:large-v3"),
+            ],
+            [InlineKeyboardButton("✏️ Rename", callback_data="rt_rename")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="rt_cancel")],
+        ]
+
+    await message.edit_text(
+        f"📁 {html.escape(folder.name)}\n"
+        f"🎥 {html.escape(f.name)} ({_file_size_str(f)})\n"
+        f"⏱ {dur_str}  ·  {tx_note}{sum_note}",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def cb_rt_transcribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    model = query.data.split(":")[1]
+
+    _cancel_history_timeout(user_id)
+    state = _history_state.pop(user_id, None)
+    if not state or not state.get("selected_file"):
+        await query.edit_message_text("Session expired. Use /history to start again.")
+        return
+
+    mp4_path = str(state["selected_file"])
+    session_key = f"retranscribe/{state['selected_folder'].name}"
+    await _transcription_queue.put((mp4_path, query.message.chat_id, session_key, model))
+    await query.edit_message_text(
+        query.message.text + f"\n\n🎙 Transcription ({model}): {_queue_status_str()}"
+    )
+
+
+async def cb_rt_send_transcript(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    _cancel_history_timeout(user_id)
+    state = _history_state.pop(user_id, None)
+    if not state or not state.get("selected_file"):
+        await query.edit_message_text("Session expired.")
+        return
+    txt_path = state["selected_file"].with_suffix(".txt")
+    if not txt_path.exists():
+        await query.edit_message_text("Transcript file not found.")
+        return
+    await query.edit_message_text(query.message.text + "\n\n📤 Sending…")
+    try:
+        with open(txt_path, "rb") as f:
+            await context.bot.send_document(
+                query.message.chat_id, document=f, filename=txt_path.name
+            )
+        if summarizer_mod.is_configured():
+            token_sum = secrets.token_hex(8)
+            _pending_summarize_txt[token_sum] = str(txt_path)
+            await query.edit_message_text(
+                query.message.text + "\n\n📄 Sent.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🤖 AI Summary", callback_data=f"summarize_txt:{token_sum}"),
+                ]]),
+            )
+        else:
+            await query.edit_message_text(query.message.text + "\n\n📄 Sent.")
+    except Exception as e:
+        await query.edit_message_text(query.message.text + f"\n\n⚠️ Failed to send: {e}")
+
+
+async def cb_rt_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    _cancel_history_timeout(user_id)
+    _history_state.pop(user_id, None)
+    await query.edit_message_text("Cancelled.")
+
+
+_DRAFT_THROTTLE = 0.15   # seconds between sendMessageDraft calls (no documented rate limit,
+                          # but throttle slightly to avoid hammering Telegram)
+
+
+async def _send_summary(
+    chat_id: int,
+    folder_name: str,
+    txt_path: Path,
+    bot,
+    user_context: str | None = None,
+) -> None:
+    """Generate (or load cached) summary and send it. Shared by all summary handlers.
+
+    - Cached path: sends immediately, no API call.
+    - Live path: uses Telegram Bot API sendMessageDraft (Bot API 9.5) to stream
+      text as a native typing bubble. Each on_status / on_text_chunk call updates
+      the same draft_id, which Telegram animates smoothly. When generation is done,
+      send_message finalises it as a real message and the bubble disappears.
+    """
+    import asyncio as _asyncio
+    import random
+
+    summary_path = txt_path.parent / ".summary.txt"
+    escaped_name = html.escape(folder_name)
+    header = f"🤖 <b>AI Summary — {escaped_name}</b>\n\n"
+
+    # ── Cached path ──────────────────────────────────────────────────────────
+    if not user_context and summary_path.exists():
+        summary = summary_path.read_text(encoding="utf-8")
+        full_text = header + "<i>(cached)</i>\n\n" + html.escape(summary)
+        await _deliver_summary(chat_id, full_text, txt_path, bot)
+        return
+
+    # ── Live generation via sendMessageDraft ─────────────────────────────────
+    # draft_id identifies this streaming session; same id → animated updates
+    draft_id = random.randint(1, 2 ** 31 - 1)
+    last_draft_ts: float = 0.0
+
+    async def _push_draft(text: str) -> None:
+        nonlocal last_draft_ts
+        now = _asyncio.get_event_loop().time()
+        if now - last_draft_ts < _DRAFT_THROTTLE:
+            return
+        try:
+            await bot.send_message_draft(
+                chat_id=chat_id,
+                draft_id=draft_id,
+                text=text,
+                parse_mode="HTML",
+            )
+            last_draft_ts = now
+        except Exception:
+            pass
+
+    async def on_status(status_text: str) -> None:
+        await _push_draft(header + status_text)
+
+    async def on_text_chunk(accumulated: str) -> None:
+        await _push_draft(header + html.escape(accumulated))
+
+    # Show initial "starting" bubble right away
+    await _push_draft(header + "⏳ Memulai…")
+
+    try:
+        summary = await summarizer_mod.summarize(
+            str(txt_path), user_context,
+            on_status=on_status,
+            on_text_chunk=on_text_chunk,
+        )
+    except Exception:
+        # Clear draft bubble on failure with an empty draft (Bot API 10.0+)
+        try:
+            await bot.send_message_draft(chat_id=chat_id, draft_id=draft_id, text="")
+        except Exception:
+            pass
+        raise
+
+    try:
+        summary_path.write_text(summary, encoding="utf-8")
+    except Exception as e:
+        logger.warning("Could not save summary file: %s", e)
+
+    # Finalise: send_message dismisses the draft bubble and delivers the real message
+    full_text = header + html.escape(summary)
+    if len(full_text) <= 4096:
+        await bot.send_message(chat_id, full_text, parse_mode="HTML")
+    else:
+        chunks = [full_text[i:i + 4000] for i in range(0, len(full_text), 4000)]
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                chunk = f"<i>(continued…)</i>\n\n{chunk}"
+            await bot.send_message(chat_id, chunk, parse_mode="HTML")
+
+    # Follow-up: offer to send full transcript
+    token_send = secrets.token_hex(8)
+    _pending_send_transcript[token_send] = str(txt_path)
+    await bot.send_message(
+        chat_id,
+        "✅ Summary selesai. Ingin kirim transkripnya?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📄 Send Transcript", callback_data=f"send_txt:{token_send}"),
+        ]]),
+    )
+
+
+async def _deliver_summary(chat_id: int, full_text: str, txt_path: Path, bot) -> None:
+    """Send a pre-built summary string and follow-up transcript button."""
+    if len(full_text) <= 4096:
+        await bot.send_message(chat_id, full_text, parse_mode="HTML")
+    else:
+        chunks = [full_text[i:i + 4000] for i in range(0, len(full_text), 4000)]
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                chunk = f"<i>(continued…)</i>\n\n{chunk}"
+            await bot.send_message(chat_id, chunk, parse_mode="HTML")
+
+    token_send = secrets.token_hex(8)
+    _pending_send_transcript[token_send] = str(txt_path)
+    await bot.send_message(
+        chat_id,
+        "✅ Summary selesai. Ingin kirim transkripnya?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📄 Send Transcript", callback_data=f"send_txt:{token_send}"),
+        ]]),
+    )
+
+
+_SUMMARY_CTX_PROMPT = (
+    "📋 <b>Sebelum membuat ringkasan, berikan informasi awal tentang meeting ini</b> "
+    "(opsional, tapi sangat membantu AI):\n\n"
+    "• Meeting ini tentang apa?\n"
+    "• Siapa saja pesertanya?\n"
+    "• Kapan meeting berlangsung?\n"
+    "• Singkatan atau istilah khusus yang perlu diketahui?\n\n"
+    "Ketik informasi di atas, atau tekan <b>Skip</b> untuk langsung generate."
+)
+
+
+def _ask_summary_context(user_id: int, txt_path: Path, folder_name: str, chat_id: int, bot):
+    """Send the context-input prompt and register pending state with a 120s timeout."""
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏭ Skip", callback_data="summary_ctx_skip"),
+    ]])
+
+    async def _send_and_track():
+        msg = await bot.send_message(chat_id, _SUMMARY_CTX_PROMPT, parse_mode="HTML", reply_markup=kb)
+        state = {
+            "txt_path": txt_path,
+            "folder_name": folder_name,
+            "chat_id": chat_id,
+            "prompt_msg_id": msg.message_id,
+        }
+        _pending_summary_context[user_id] = state
+        state["timeout_task"] = asyncio.create_task(
+            _summary_ctx_timeout(user_id, bot, chat_id, msg.message_id)
+        )
+
+    return _send_and_track()
+
+
+async def cb_rt_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    _cancel_history_timeout(user_id)
+    state = _history_state.pop(user_id, None)
+    if not state or not state.get("selected_file"):
+        await query.edit_message_text("Session expired. Use /history to start again.")
+        return
+
+    txt_path = state["selected_file"].with_suffix(".txt")
+    if not txt_path.exists():
+        await query.edit_message_text("Transcript not found. Transcribe first.")
+        return
+
+    folder_name = state["selected_folder"].name
+    await query.edit_message_text(f"📁 <b>{html.escape(folder_name)}</b>", parse_mode="HTML")
+    await _ask_summary_context(user_id, txt_path, folder_name, query.message.chat_id, context.bot)
+
+
+async def cb_rt_resummarize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-summarize from /history — clears cached .summary.txt first so Skip also regenerates."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    _cancel_history_timeout(user_id)
+    state = _history_state.pop(user_id, None)
+    if not state or not state.get("selected_file"):
+        await query.edit_message_text("Session expired. Use /history to start again.")
+        return
+
+    txt_path = state["selected_file"].with_suffix(".txt")
+    if not txt_path.exists():
+        await query.edit_message_text("Transcript not found. Transcribe first.")
+        return
+
+    folder_name = state["selected_folder"].name
+    # Delete cached summary so Skip also generates a fresh one
+    try:
+        (state["selected_folder"] / ".summary.txt").unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    await query.edit_message_text(f"📁 <b>{html.escape(folder_name)}</b>", parse_mode="HTML")
+    await _ask_summary_context(user_id, txt_path, folder_name, query.message.chat_id, context.bot)
+
+
+async def cb_rt_send_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the cached .summary.txt from /history without regenerating."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    _cancel_history_timeout(user_id)
+    state = _history_state.pop(user_id, None)
+    if not state or not state.get("selected_folder"):
+        await query.edit_message_text("Session expired. Use /history to start again.")
+        return
+
+    folder = state["selected_folder"]
+    summary_path = folder / ".summary.txt"
+    if not summary_path.exists():
+        await query.edit_message_text("Summary file not found. Use 🤖 AI Summary to generate one.")
+        return
+
+    txt_path = state["selected_file"].with_suffix(".txt")
+    folder_name = folder.name
+    summary = summary_path.read_text(encoding="utf-8")
+
+    await query.edit_message_text(f"📁 <b>{html.escape(folder_name)}</b>", parse_mode="HTML")
+
+    header = f"🤖 <b>AI Summary — {html.escape(folder_name)}</b> <i>(cached)</i>\n\n"
+    full_text = header + html.escape(summary)
+    await _deliver_summary(query.message.chat_id, full_text, txt_path, context.bot)
+
+
+async def cb_summarize_txt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Token-based AI Summary — used from post-transcription and post-send-transcript buttons."""
+    query = update.callback_query
+    await query.answer()
+    token = query.data.split(":", 1)[1]
+    txt_path_str = _pending_summarize_txt.pop(token, None)
+    if not txt_path_str or not Path(txt_path_str).exists():
+        await query.edit_message_text(query.message.text + "\n\n⚠️ File not found.")
+        return
+
+    txt_path = Path(txt_path_str)
+    folder_name = txt_path.parent.name
+    user_id = update.effective_user.id
+    await _ask_summary_context(user_id, txt_path, folder_name, query.message.chat_id, context.bot)
+
+
+async def cb_summary_ctx_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User pressed ⏭ Lewati — generate summary without extra context."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    _cancel_summary_ctx_timeout(user_id)
+    state = _pending_summary_context.pop(user_id, None)
+    if not state:
+        await query.edit_message_text("⚠️ Session tidak ditemukan. Coba lagi.")
+        return
+
+    txt_path: Path = state["txt_path"]
+    folder_name: str = state["folder_name"]
+    chat_id: int = state["chat_id"]
+
+    await query.edit_message_text(f"📁 <b>{html.escape(folder_name)}</b>", parse_mode="HTML")
+    try:
+        await _send_summary(chat_id, folder_name, txt_path, context.bot)
+    except Exception as e:
+        logger.error("Summarization failed for %s: %s", txt_path, e)
+        await context.bot.send_message(chat_id, f"⚠️ Summarization failed: {e}")
+
+
+async def _handle_summary_context_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Called from msg_handler when user is in summary context input state."""
+    user_id = update.effective_user.id
+    _cancel_summary_ctx_timeout(user_id)
+    state = _pending_summary_context.pop(user_id, None)
+    if not state:
+        return
+
+    user_ctx = update.message.text.strip()
+    txt_path: Path = state["txt_path"]
+    folder_name: str = state["folder_name"]
+    chat_id: int = state["chat_id"]
+
+    # Remove the Skip button from the prompt message so it can't be clicked late
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=state["prompt_msg_id"],
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+    try:
+        await _send_summary(chat_id, folder_name, txt_path, context.bot, user_context=user_ctx)
+    except Exception as e:
+        logger.error("Summarization failed for %s: %s", txt_path, e)
+        await context.bot.send_message(chat_id, f"⚠️ Summarization failed: {e}")
+
+
+async def cb_rt_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    state = _history_state.get(user_id)
+    if not state or not state.get("selected_folder"):
+        await query.edit_message_text("Session expired. Use /history to start again.")
+        return
+    state["sub_state"] = "input_rename"
+    state["pending_rename"] = None
+    state["rename_msg_id"] = query.message.message_id
+    await query.edit_message_text(
+        f"📁 {html.escape(state['selected_folder'].name)}\n\n"
+        f"Send the new name: (100s timeout)",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Abort", callback_data="rt_rename_abort"),
+        ]]),
+    )
+    _reset_history_timeout(user_id, context.bot, query.message.chat_id, query.message.message_id)
+
+
+async def _handle_rename_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    state = _history_state.get(user_id)
+    if not state:
+        return
+
+    new_name = update.message.text.strip()
+    folder = state["selected_folder"]
+    chat_id = update.effective_chat.id
+    msg_id = state.get("rename_msg_id")
+
+    if not new_name:
+        await update.message.reply_text("Name can't be empty.")
+        return
+    if len(new_name) > 80:
+        await update.message.reply_text("Name too long (max 80 characters).")
+        return
+    if any(c in _RENAME_FORBIDDEN for c in new_name):
+        await update.message.reply_text('Name contains invalid characters: / \\ : * ? " < > |')
+        return
+    if new_name == folder.name:
+        await update.message.reply_text("That's already the current name.")
+        return
+    if (folder.parent / new_name).exists():
+        await update.message.reply_text(
+            f"A folder named <b>{html.escape(new_name)}</b> already exists.",
+            parse_mode="HTML",
+        )
+        return
+
+    state["pending_rename"] = new_name
+    old_prefix = _extract_file_prefix(folder.name)
+    new_prefix = _extract_file_prefix(new_name)
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Confirm", callback_data="rt_rename_confirm"),
+        InlineKeyboardButton("✏️ Change",  callback_data="rt_rename_change"),
+    ], [
+        InlineKeyboardButton("❌ Abort", callback_data="rt_rename_abort"),
+    ]])
+    # Show what files will be renamed if prefix changes
+    if old_prefix != new_prefix:
+        file_note = f"\n📄 Files: <code>{html.escape(old_prefix)}.*</code> → <code>{html.escape(new_prefix)}.*</code>"
+    else:
+        file_note = ""
+    confirm_text = (
+        f"📁 {html.escape(folder.name)}\n"
+        f"↪️ Rename to: <b>{html.escape(new_name)}</b>{file_note}\n\n"
+        f"Confirm?"
+    )
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id,
+            text=confirm_text,
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    except Exception:
+        msg = await update.message.reply_text(confirm_text, reply_markup=kb, parse_mode="HTML")
+        state["rename_msg_id"] = msg.message_id
+    _reset_history_timeout(user_id, context.bot, chat_id, state["rename_msg_id"])
+
+
+async def cb_rt_rename_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    state = _history_state.get(user_id)
+    if not state or not state.get("pending_rename"):
+        await query.edit_message_text("Session expired. Use /history to start again.")
+        return
+
+    new_name = state["pending_rename"]
+    folder = state["selected_folder"]
+    new_path = folder.parent / new_name
+
+    if new_path.exists():
+        await query.edit_message_text(
+            f"⚠️ A folder named <b>{html.escape(new_name)}</b> already exists.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Determine file prefix change
+    old_prefix = _extract_file_prefix(folder.name)
+    new_prefix = _extract_file_prefix(new_name)
+
+    # Rename files with matching stem inside the folder first
+    rename_errors = []
+    if old_prefix != new_prefix:
+        for f in sorted(folder.iterdir()):
+            if f.is_file() and not f.name.startswith('.') and f.stem == old_prefix:
+                try:
+                    f.rename(f.parent / (new_prefix + f.suffix))
+                except Exception as e:
+                    rename_errors.append(f.name)
+                    logger.warning("Could not rename file %s: %s", f, e)
+
+    # Rename the folder itself
+    try:
+        folder.rename(new_path)
+    except Exception as e:
+        await query.edit_message_text(f"⚠️ Rename failed: {e}")
+        return
+
+    # Update .metadata.json
+    meta_path = new_path / ".metadata.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["recording_name"] = new_prefix
+            meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass  # non-fatal
+
+    # Update state
+    state["selected_folder"] = new_path
+    if state.get("selected_file"):
+        old_file = state["selected_file"]
+        state["selected_file"] = new_path / (new_prefix + old_file.suffix)
+    state["sub_state"] = None
+    state["pending_rename"] = None
+    state["folders"] = [f for f in _get_recording_folders() if _find_media_files(f)]
+
+    # Return to actions screen (it will show the updated folder name)
+    await _show_history_actions(query.message, state)
+    _reset_history_timeout(user_id, context.bot, query.message.chat_id, query.message.message_id)
+
+    if rename_errors:
+        await context.bot.send_message(
+            query.message.chat_id,
+            f"⚠️ Could not rename: {', '.join(rename_errors)}",
+        )
+
+
+async def cb_rt_rename_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    state = _history_state.get(user_id)
+    if not state:
+        await query.edit_message_text("Session expired.")
+        return
+    state["pending_rename"] = None
+    await query.edit_message_text(
+        f"📁 {html.escape(state['selected_folder'].name)}\n\n"
+        f"Send the new name: (100s timeout)",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Abort", callback_data="rt_rename_abort"),
+        ]]),
+    )
+    _reset_history_timeout(user_id, context.bot, query.message.chat_id, query.message.message_id)
+
+
+async def cb_rt_rename_abort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    state = _history_state.get(user_id)
+    if not state:
+        await query.edit_message_text("Session expired. Use /history to start again.")
+        return
+    state["sub_state"] = None
+    state["pending_rename"] = None
+    await _show_history_actions(query.message, state)
+    _reset_history_timeout(user_id, context.bot, query.message.chat_id, query.message.message_id)
+
+
 # ── /status ───────────────────────────────────────────────────────────────────
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -985,23 +2182,96 @@ async def _restore_schedules(bot) -> None:
         logger.info("Notified %d missed scheduled recording(s)", len(missed))
 
 
+# ── Reschedule helpers ────────────────────────────────────────────────────────
+
+async def _reschedule_timeout(user_id: int, bot, chat_id: int, message_id: int) -> None:
+    await asyncio.sleep(100)
+    if _reschedule_state.pop(user_id, None) is not None:
+        try:
+            await bot.edit_message_text(
+                "⏱ Reschedule timed out.",
+                chat_id=chat_id, message_id=message_id,
+            )
+        except Exception:
+            pass
+
+
+def _reset_reschedule_timeout(user_id: int, bot, chat_id: int, message_id: int) -> None:
+    state = _reschedule_state.get(user_id)
+    if not state:
+        return
+    t = state.get("timeout_task")
+    if t and not t.done():
+        t.cancel()
+    state["timeout_task"] = asyncio.create_task(
+        _reschedule_timeout(user_id, bot, chat_id, message_id)
+    )
+
+
+def _cancel_reschedule_timeout(user_id: int) -> None:
+    state = _reschedule_state.get(user_id)
+    if not state:
+        return
+    t = state.get("timeout_task")
+    if t and not t.done():
+        t.cancel()
+
+
 async def _post_init(application: Application) -> None:
     asyncio.create_task(_transcription_worker(application.bot))
     await _restore_schedules(application.bot)
+    _cleanup_stale_wavs()
+
+
+def _cleanup_stale_wavs() -> None:
+    """Delete leftover .wav files in recordings that weren't cleaned up (e.g. after a crash)."""
+    try:
+        count = 0
+        for wav in RECORDINGS_DIR.rglob("*.wav"):
+            try:
+                wav.unlink()
+                count += 1
+                logger.info("Removed stale WAV: %s", wav)
+            except Exception as e:
+                logger.warning("Could not remove stale WAV %s: %s", wav, e)
+        if count:
+            logger.info("Startup cleanup: removed %d stale WAV file(s)", count)
+    except Exception as e:
+        logger.warning("Stale WAV cleanup failed: %s", e)
 
 
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
     app.add_error_handler(_error_handler)
-    app.add_handler(CommandHandler("record", cmd_record))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("peek", cmd_peek))
-    app.add_handler(CommandHandler("schedule", cmd_schedule))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("ongoing", cmd_ongoing))
+    app.add_handler(CommandHandler("record",        cmd_record))
+    app.add_handler(CommandHandler("stop",          cmd_stop))
+    app.add_handler(CommandHandler("peek",          cmd_peek))
+    app.add_handler(CommandHandler("schedule",      cmd_schedule))
+    app.add_handler(CommandHandler("status",        cmd_status))
+    app.add_handler(CommandHandler("history",       cmd_history))
+    app.add_handler(CallbackQueryHandler(cb_rt_page,             pattern=r"^rt_page:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_rt_folder,           pattern=r"^rt_folder:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_rt_file,             pattern=r"^rt_file:\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_rt_transcribe,       pattern=r"^rt_transcribe:"))
+    app.add_handler(CallbackQueryHandler(cb_rt_send_transcript,  pattern="^rt_send_transcript$"))
+    app.add_handler(CallbackQueryHandler(cb_rt_summarize,        pattern="^rt_summarize$"))
+    app.add_handler(CallbackQueryHandler(cb_rt_resummarize,      pattern="^rt_resummarize$"))
+    app.add_handler(CallbackQueryHandler(cb_rt_send_summary,     pattern="^rt_send_summary$"))
+    app.add_handler(CallbackQueryHandler(cb_rt_cancel,           pattern="^rt_cancel$"))
+    app.add_handler(CallbackQueryHandler(cb_rt_rename,           pattern="^rt_rename$"))
+    app.add_handler(CallbackQueryHandler(cb_rt_rename_confirm,   pattern="^rt_rename_confirm$"))
+    app.add_handler(CallbackQueryHandler(cb_rt_rename_change,    pattern="^rt_rename_change$"))
+    app.add_handler(CallbackQueryHandler(cb_rt_rename_abort,     pattern="^rt_rename_abort$"))
+    app.add_handler(CallbackQueryHandler(cb_send_txt,            pattern=r"^send_txt:"))
+    app.add_handler(CallbackQueryHandler(cb_summarize_txt,       pattern=r"^summarize_txt:"))
+    app.add_handler(CallbackQueryHandler(cb_summary_ctx_skip,    pattern="^summary_ctx_skip$"))
     app.add_handler(CallbackQueryHandler(cb_start_now,           pattern="^start_now$"))
     app.add_handler(CallbackQueryHandler(cb_schedule_later,      pattern="^schedule_later$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_schedule,     pattern=r"^cancel_schedule_(\d+)$"))
+    app.add_handler(CallbackQueryHandler(cb_reschedule_start,    pattern=r"^reschedule_\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_reschedule_confirm,  pattern="^reschedule_confirm$"))
+    app.add_handler(CallbackQueryHandler(cb_reschedule_change,   pattern="^reschedule_change$"))
+    app.add_handler(CallbackQueryHandler(cb_reschedule_abort,    pattern="^reschedule_abort$"))
     app.add_handler(CallbackQueryHandler(cb_confirm_new_session, pattern="^confirm_new_session$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_new_session,  pattern="^cancel_new_session$"))
     app.add_handler(CallbackQueryHandler(cb_use_default,         pattern="^use_default$"))
@@ -1012,7 +2282,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_stop_session,        pattern=r"^stop_session_(\d+)$"))
     app.add_handler(CallbackQueryHandler(cb_stop_all,            pattern="^stop_all_sessions$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_stop,              pattern="^cancel_stop$"))
-    app.add_handler(CallbackQueryHandler(_handle_transcribe_callback, pattern=r"^(transcribe|skip):"))
+    app.add_handler(CallbackQueryHandler(_handle_transcribe_callback, pattern=r"^(transcribe_medium|transcribe_large|skip):"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
     logger.info("Zoomy bot started (@baboonrecord_bot)")
     app.run_polling(drop_pending_updates=True)

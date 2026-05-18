@@ -1,15 +1,31 @@
 import asyncio
-import os
-import subprocess
+import logging
+import os  # for WHISPER_THREADS env var
 from faster_whisper import WhisperModel
 
+logger = logging.getLogger(__name__)
+
+# Default to 10 threads, leaving 2 cores free for the OS and bot overhead.
+# Override with WHISPER_THREADS env var.
+_CPU_THREADS = int(os.environ.get("WHISPER_THREADS", "10"))
+
 _model: WhisperModel | None = None
+_model_name: str | None = None
 
 
 def _get_model(model_name: str) -> WhisperModel:
-    global _model
-    if _model is None:
-        _model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    global _model, _model_name
+    if _model is None or _model_name != model_name:
+        if _model is not None:
+            logger.info("Switching Whisper model: %s → %s", _model_name, model_name)
+        logger.info("Loading Whisper model '%s' with %d CPU threads", model_name, _CPU_THREADS)
+        _model = WhisperModel(
+            model_name,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=_CPU_THREADS,
+        )
+        _model_name = model_name
     return _model
 
 
@@ -23,44 +39,36 @@ def _fmt_srt_time(seconds: float) -> str:
 
 def _transcribe_sync(mp4_path: str, model_name: str, language: str | None) -> tuple[str, str]:
     base = mp4_path[:-4]          # strip ".mp4"
-    wav_path = base + ".wav"      # temp audio
     txt_path = base + ".txt"
     srt_path = base + ".srt"
 
-    subprocess.run(
-        [
-            "ffmpeg", "-i", mp4_path,
-            "-vn", "-ar", "16000", "-ac", "1",
-            "-f", "wav", wav_path,
-            "-y", "-loglevel", "error",
-        ],
-        check=True,
+    # faster-whisper decodes audio internally via ffmpeg — no temp WAV needed.
+    # vad_filter skips silent segments before inference — speeds up long recordings
+    # with dead time (waiting room, pauses, end-of-meeting silence).
+    model = _get_model(model_name)
+    segments, _ = model.transcribe(
+        mp4_path,
+        language=language or None,
+        vad_filter=True,
     )
-    try:
-        model = _get_model(model_name)
-        segments, _ = model.transcribe(wav_path, language=language or None)
-        segments = list(segments)  # consume generator before WAV is deleted
 
-        txt_lines: list[str] = []
-        srt_blocks: list[str] = []
-        for i, seg in enumerate(segments, 1):
-            text = seg.text.strip()
-            txt_lines.append(text)
-            srt_blocks.append(
-                f"{i}\n"
-                f"{_fmt_srt_time(seg.start)} --> {_fmt_srt_time(seg.end)}\n"
-                f"{text}\n"
-            )
+    txt_lines: list[str] = []
+    srt_blocks: list[str] = []
+    for i, seg in enumerate(segments, 1):
+        text = seg.text.strip()
+        txt_lines.append(text)
+        srt_blocks.append(
+            f"{i}\n"
+            f"{_fmt_srt_time(seg.start)} --> {_fmt_srt_time(seg.end)}\n"
+            f"{text}\n"
+        )
 
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(txt_lines))
-        with open(srt_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(srt_blocks))
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(txt_lines))
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(srt_blocks))
 
-        return txt_path, srt_path
-    finally:
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
+    return txt_path, srt_path
 
 
 async def transcribe(

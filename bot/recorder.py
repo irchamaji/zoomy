@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -154,6 +155,7 @@ class ZoomRecorder:
         self.current_url: Optional[str] = None
         self.output_path: Optional[Path] = None
         self._start_time: Optional[float] = None
+        self._started_at: Optional[datetime] = None
         self._auto_ended = False
         self._ffmpeg: Optional[subprocess.Popen] = None
         self._stop_event = asyncio.Event()
@@ -184,6 +186,7 @@ class ZoomRecorder:
         self.current_url = url
         self._stop_event.clear()
         self._start_time = time.monotonic()
+        self._started_at = datetime.now()
 
         try:
             meeting_id, password = parse_zoom_url(url)
@@ -253,6 +256,21 @@ class ZoomRecorder:
             self._stop_ffmpeg()
             self.is_recording = False
             self.current_url = None
+
+            if self.output_path:
+                metadata = {
+                    "recording_name": self.recording_prefix,
+                    "url": url,
+                    "duration_seconds": elapsed,
+                    "started_at": self._started_at.isoformat() if self._started_at else None,
+                }
+                try:
+                    meta_path = self.output_path.parent / ".metadata.json"
+                    meta_path.write_text(
+                        json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+                    )
+                except Exception as e:
+                    logger.warning("Could not write metadata: %s", e)
 
             if self.output_path and self.on_stopped:
                 m, s = divmod(elapsed, 60)
@@ -542,7 +560,7 @@ class ZoomRecorder:
             "-movflags", "+faststart",
             output,
         ]
-        log_path = Path(output).parent / "ffmpeg.log"
+        log_path = Path(output).parent / ".ffmpeg.log"
         ffmpeg_log = open(log_path, "w", encoding="utf-8")
         logger.info("FFmpeg log → %s", log_path)
         return subprocess.Popen(
