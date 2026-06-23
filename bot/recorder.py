@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import struct
 import subprocess
 import time
 from datetime import datetime
@@ -17,8 +18,24 @@ from playwright.async_api import async_playwright, Page
 logger = logging.getLogger(__name__)
 
 RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "/recordings"))
-GUEST_NAME = os.environ.get("GUEST_NAME", "Zoomy")
+GUEST_NAME = os.environ.get("GUEST_NAME", "zoomy.ircham.dev")
 DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
+
+# ── Audio-wait settings ───────────────────────────────────────────────────────
+# How long (seconds) to wait for audio before starting the recording anyway.
+# Set to 0 to disable the feature and start FFmpeg immediately on join.
+AUDIO_WAIT_TIMEOUT = int(os.environ.get("AUDIO_WAIT_TIMEOUT", "300"))
+# Minimum RMS level (out of 32 767) considered "audio present".
+AUDIO_RMS_THRESHOLD = int(os.environ.get("AUDIO_RMS_THRESHOLD", "100"))
+_AUDIO_SAMPLE_RATE = 16_000   # Hz — enough for level detection, low CPU
+_AUDIO_CHUNK_SECS = 0.25      # read window per iteration
+
+# ── Silence-warning settings ──────────────────────────────────────────────────
+# Seconds of continuous silence during recording before Telegram is notified.
+# Set to 0 to disable.
+SILENT_WARN_SECS = int(os.environ.get("SILENT_WARN_SECS", "60"))
+# How long (seconds) a user-initiated snooze suppresses further warnings.
+SILENT_SNOOZE_SECS = int(os.environ.get("SILENT_SNOOZE_SECS", "300"))
 
 Callback = Callable[..., Awaitable[None]]
 
@@ -38,6 +55,13 @@ def build_web_client_url(meeting_id: str, password: str) -> str:
     if password:
         url += f"?pwd={password}"
     return url
+
+
+def _is_google_meet_url(url: str) -> bool:
+    try:
+        return "meet.google.com" in urlparse(url).netloc.lower()
+    except Exception:
+        return False
 
 
 # ── Display pool ──────────────────────────────────────────────────────────────
@@ -137,20 +161,31 @@ class ZoomRecorder:
         guest_name: str = GUEST_NAME,
         recording_prefix: Optional[str] = None,
         resolution: str = "1080p",
+        meeting_password: Optional[str] = None,
         on_started: Optional[Callback] = None,
         on_stopped: Optional[Callback] = None,
         on_error: Optional[Callback] = None,
         on_dialog: Optional[Callback] = None,
+        on_waiting: Optional[Callback] = None,
+        on_silence_warn: Optional[Callback] = None,
+        on_audio_returned: Optional[Callback] = None,
     ):
         self.display = display
         self.sink = sink
         self.guest_name = guest_name
         self.recording_prefix = recording_prefix
         self.resolution = resolution
+        self.meeting_password = meeting_password
         self.on_started = on_started
         self.on_stopped = on_stopped
         self.on_error = on_error
         self.on_dialog = on_dialog
+        self.on_waiting = on_waiting
+        self.on_silence_warn = on_silence_warn
+        self.on_audio_returned = on_audio_returned
+        # Silence-monitor state — mutated by silence_snooze() / silence_wait_for_audio()
+        self._silence_state: str = "monitoring"   # monitoring | warned | snoozed | waiting
+        self._snooze_until: float = 0.0
         self.is_recording = False
         self.current_url: Optional[str] = None
         self.output_path: Optional[Path] = None
@@ -158,8 +193,10 @@ class ZoomRecorder:
         self._started_at: Optional[datetime] = None
         self._auto_ended = False
         self._ffmpeg: Optional[subprocess.Popen] = None
+        self._ffmpeg_log = None
         self._stop_event = asyncio.Event()
         self._dialog_pending: bool = False
+        self._session_errored: bool = False
 
     def elapsed_str(self) -> str:
         if self._start_time is None:
@@ -188,9 +225,14 @@ class ZoomRecorder:
         self._start_time = time.monotonic()
         self._started_at = datetime.now()
 
+        is_google_meet = _is_google_meet_url(url)
+
         try:
-            meeting_id, password = parse_zoom_url(url)
-            web_url = build_web_client_url(meeting_id, password)
+            if is_google_meet:
+                web_url = url
+            else:
+                meeting_id, password = parse_zoom_url(url)
+                web_url = build_web_client_url(meeting_id, password)
 
             if not self.recording_prefix:
                 self.recording_prefix = randomname.get_name()
@@ -225,17 +267,58 @@ class ZoomRecorder:
                 )
                 page = await ctx.new_page()
 
-                await self._join_meeting(page, web_url)
+                if is_google_meet:
+                    await self._join_google_meet(page, web_url)
+                    chrome_height = 0  # no crop for Google Meet
+                else:
+                    await self._join_meeting(page, web_url)
+                    # Measure browser chrome height for cropping
+                    try:
+                        chrome_height = await page.evaluate(
+                            "window.outerHeight - window.innerHeight"
+                        )
+                        chrome_height = max(0, int(chrome_height))
+                    except Exception:
+                        chrome_height = 0
+                    logger.info("Browser chrome height: %dpx", chrome_height)
 
-                # Measure browser chrome height for cropping
-                try:
-                    chrome_height = await page.evaluate(
-                        "window.outerHeight - window.innerHeight"
-                    )
-                    chrome_height = max(0, int(chrome_height))
-                except Exception:
-                    chrome_height = 0
-                logger.info("Browser chrome height: %dpx", chrome_height)
+                if is_google_meet:
+                    async def _gmeet_guard():
+                        _cant_join = ("you can't join this video call", "cannot join this video call")
+                        while not self._stop_event.is_set():
+                            await asyncio.sleep(3)
+                            try:
+                                if page.is_closed():
+                                    return
+                                current_url = page.url
+                                if "meet.google.com" not in current_url:
+                                    msg = f"Google Meet: browser redirected to {current_url!r}."
+                                elif any(p in (await page.evaluate("document.body.innerText")).lower() for p in _cant_join):
+                                    msg = "Google Meet: unable to join this video call. Meeting may require a signed-in Google account."
+                                else:
+                                    continue
+                                self._session_errored = True
+                                self._stop_event.set()
+                                logger.warning("GMeet guard: %s", msg)
+                                if self.on_error:
+                                    await self.on_error(msg)
+                                return
+                            except Exception:
+                                pass
+                    guard = asyncio.create_task(_gmeet_guard())
+                    try:
+                        await self._wait_for_audio()
+                    finally:
+                        guard.cancel()
+                        try:
+                            await guard
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                else:
+                    await self._wait_for_audio()
+
+                if self._session_errored:
+                    return
 
                 self._ffmpeg = self._start_ffmpeg(str(self.output_path), chrome_height)
                 logger.info("FFmpeg started → %s", self.output_path)
@@ -243,7 +326,19 @@ class ZoomRecorder:
                 if self.on_started:
                     await self.on_started(str(self.output_path))
 
-                await self._watch_meeting(page)
+                silence_task = asyncio.create_task(self._silence_monitor())
+                try:
+                    if is_google_meet:
+                        await self._watch_google_meet(page)
+                    else:
+                        await self._watch_meeting(page)
+                finally:
+                    silence_task.cancel()
+                    try:
+                        await silence_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
                 self._auto_ended = not self._stop_event.is_set()
                 await browser.close()
 
@@ -257,7 +352,7 @@ class ZoomRecorder:
             self.is_recording = False
             self.current_url = None
 
-            if self.output_path:
+            if self.output_path and not self._session_errored:
                 metadata = {
                     "recording_name": self.recording_prefix,
                     "url": url,
@@ -272,7 +367,7 @@ class ZoomRecorder:
                 except Exception as e:
                     logger.warning("Could not write metadata: %s", e)
 
-            if self.output_path and self.on_stopped:
+            if self.output_path and not self._session_errored and self.on_stopped:
                 m, s = divmod(elapsed, 60)
                 duration_str = f"{m}m{s:02d}s"
                 size_str = self.file_size_str()
@@ -335,16 +430,23 @@ class ZoomRecorder:
             return
         JS = """
             (() => {
-                const OK_LABELS = ['ok', 'got it', 'i understand', 'accept', 'dismiss', 'continue'];
+                const OK_LABELS = ['ok', 'got it', 'i understand', 'accept', 'dismiss', 'continue', 'close'];
 
-                // Pass 1: modal/dialog containers
+                // Zoom uses both <button> and [role="button"] divs/spans
+                function clickables(root) {
+                    return [...root.querySelectorAll('button, [role="button"]')];
+                }
+
+                // Pass 1: modal/dialog containers (including Zoom-specific classes)
                 const containers = document.querySelectorAll(
                     '[role="dialog"], [role="alertdialog"], '
-                    + '[class*="modal"], [class*="dialog"], [class*="overlay"], [class*="popup"]'
+                    + '[class*="modal"], [class*="dialog"], [class*="overlay"], [class*="popup"], '
+                    + '[class*="zm-modal"], [class*="consent"], [class*="recording-notice"], '
+                    + '[class*="notify"], [class*="notice"]'
                 );
                 for (const el of containers) {
                     if (el.offsetParent === null) continue;
-                    for (const btn of el.querySelectorAll('button')) {
+                    for (const btn of clickables(el)) {
                         const txt = (btn.textContent || btn.getAttribute('aria-label') || '')
                                     .trim().toLowerCase();
                         if (OK_LABELS.includes(txt) && btn.offsetParent !== null) {
@@ -355,13 +457,14 @@ class ZoomRecorder:
                     }
                 }
 
-                // Pass 2: notification banners / top bars (not inside a dialog container)
+                // Pass 2: <button> elements only — must be exactly "ok" to avoid over-matching
                 for (const btn of document.querySelectorAll('button')) {
                     const txt = (btn.textContent || btn.getAttribute('aria-label') || '')
                                 .trim().toLowerCase();
                     if (txt === 'ok' && btn.offsetParent !== null) {
                         const container = btn.closest('[class]');
-                        const text = (container?.innerText || btn.parentElement?.innerText || 'notification').trim();
+                        const text = (container?.innerText || btn.parentElement?.innerText || '').trim();
+                        if (!text) continue;
                         btn.click();
                         return text;
                     }
@@ -385,10 +488,354 @@ class ZoomRecorder:
         finally:
             self._dialog_pending = False
 
+    # ── Silence-monitor control (called by bot.py callbacks) ─────────────────
+
+    def silence_snooze(self) -> None:
+        """Suppress silence warnings for SILENT_SNOOZE_SECS seconds."""
+        self._silence_state = "snoozed"
+        self._snooze_until = time.monotonic() + SILENT_SNOOZE_SECS
+        logger.info("Silence snoozed for %ds", SILENT_SNOOZE_SECS)
+
+    def silence_wait_for_audio(self) -> None:
+        """Enter wait-for-audio mode: no more silence warnings until audio returns."""
+        self._silence_state = "waiting"
+        logger.info("Silence: entering wait-for-audio mode")
+
+    # ── Silence monitor ───────────────────────────────────────────────────────
+
+    async def _silence_monitor(self) -> None:
+        """Background task: watch for continuous silence while FFmpeg is recording.
+
+        State machine:
+          monitoring → warned     : silence ≥ SILENT_WARN_SECS   → on_silence_warn()
+          snoozed    → warned     : snooze expired, still silent  → on_silence_warn()
+          warned / waiting / snoozed → monitoring : audio returns → on_audio_returned()
+              (on_audio_returned only fires when state was warned or waiting)
+
+        External transitions (via bot.py callbacks):
+          silence_snooze()         : warned → snoozed
+          silence_wait_for_audio() : warned → waiting
+        """
+        if SILENT_WARN_SECS <= 0:
+            return
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "parec",
+                f"--device={self.sink}",
+                "--format=s16le",
+                f"--rate={_AUDIO_SAMPLE_RATE}",
+                "--channels=1",
+                "--latency-msec=100",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            logger.warning("parec not found — silence monitor disabled")
+            return
+
+        chunk_bytes = int(_AUDIO_SAMPLE_RATE * 2 * _AUDIO_CHUNK_SECS)
+        silent_since: float | None = None
+
+        logger.info(
+            "Silence monitor started (warn_secs=%d, rms_threshold=%d)",
+            SILENT_WARN_SECS, AUDIO_RMS_THRESHOLD,
+        )
+
+        try:
+            while not self._stop_event.is_set():
+                if proc.returncode is not None:
+                    logger.warning("Silence monitor: parec exited (code %d)", proc.returncode)
+                    return
+
+                try:
+                    data = await asyncio.wait_for(proc.stdout.read(chunk_bytes), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+
+                if not data:
+                    logger.warning("Silence monitor: parec EOF")
+                    return
+
+                n = len(data) // 2
+                if n == 0:
+                    continue
+
+                samples = struct.unpack(f"{n}h", data[: n * 2])
+                rms = (sum(s * s for s in samples) / n) ** 0.5
+                now = time.monotonic()
+
+                if rms <= AUDIO_RMS_THRESHOLD:
+                    # ── SILENCE ───────────────────────────────────────────────
+                    if silent_since is None:
+                        silent_since = now
+                    silence_secs = int(now - silent_since)
+
+                    if self._silence_state == "monitoring" and silence_secs >= SILENT_WARN_SECS:
+                        self._silence_state = "warned"
+                        logger.info("Silence warning: %ds of continuous silence", silence_secs)
+                        if self.on_silence_warn:
+                            await self.on_silence_warn(silence_secs)
+
+                    elif (
+                        self._silence_state == "snoozed"
+                        and now >= self._snooze_until
+                        and silence_secs >= SILENT_WARN_SECS
+                    ):
+                        self._silence_state = "warned"
+                        logger.info(
+                            "Silence snooze expired — re-warning (%ds of silence)", silence_secs
+                        )
+                        if self.on_silence_warn:
+                            await self.on_silence_warn(silence_secs)
+
+                else:
+                    # ── AUDIO ─────────────────────────────────────────────────
+                    if silent_since is not None:
+                        prev_state = self._silence_state
+                        silence_secs = int(now - silent_since)
+                        silent_since = None
+                        self._silence_state = "monitoring"
+                        self._snooze_until = 0.0
+
+                        if prev_state in ("warned", "waiting"):
+                            logger.info(
+                                "Audio returned after %ds of silence (was '%s')",
+                                silence_secs, prev_state,
+                            )
+                            if self.on_audio_returned:
+                                await self.on_audio_returned()
+
+        finally:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            logger.info("Silence monitor stopped")
+
+    async def _wait_for_audio(self) -> None:
+        """Hold until audio is detected on the virtual sink, then return.
+
+        Uses *parec* (PulseAudio record) to sample the virtual monitor source
+        in 250 ms chunks.  Computes RMS of each chunk and returns as soon as
+        the level exceeds AUDIO_RMS_THRESHOLD.
+
+        Falls back to immediate return on:
+          • AUDIO_WAIT_TIMEOUT == 0 (feature disabled)
+          • parec binary not found
+          • parec exits early (e.g. sink not ready)
+          • _stop_event set (user called /stop before meeting started)
+        """
+        if AUDIO_WAIT_TIMEOUT <= 0:
+            return
+
+        chunk_bytes = int(_AUDIO_SAMPLE_RATE * 2 * _AUDIO_CHUNK_SECS)  # 1 ch, s16le
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "parec",
+                f"--device={self.sink}",
+                "--format=s16le",
+                f"--rate={_AUDIO_SAMPLE_RATE}",
+                "--channels=1",
+                "--latency-msec=100",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            logger.warning("parec not found — starting FFmpeg immediately (no audio wait)")
+            return
+
+        # Only notify "waiting" if silence persists beyond this many seconds.
+        # Active meetings typically have audio within 3–5 s of joining.
+        _NOTIFY_GRACE_SECS = 5.0
+
+        start = time.monotonic()
+        notified_waiting = False
+        logger.info(
+            "Waiting for audio on %s (threshold=%d RMS, no timeout)",
+            self.sink, AUDIO_RMS_THRESHOLD,
+        )
+
+        try:
+            while not self._stop_event.is_set():
+                # parec exited early (e.g. sink not ready yet)
+                if proc.returncode is not None:
+                    logger.warning(
+                        "parec exited (code %d) — starting FFmpeg immediately", proc.returncode
+                    )
+                    return
+
+                try:
+                    data = await asyncio.wait_for(
+                        proc.stdout.read(chunk_bytes), timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                else:
+                    if not data:
+                        logger.warning("parec EOF — starting FFmpeg immediately")
+                        return
+
+                    n = len(data) // 2
+                    if n > 0:
+                        samples = struct.unpack(f"{n}h", data[: n * 2])
+                        rms = (sum(s * s for s in samples) / n) ** 0.5
+
+                        if rms > AUDIO_RMS_THRESHOLD:
+                            elapsed = time.monotonic() - start
+                            logger.info(
+                                "Audio detected — RMS=%.1f > threshold=%d at %.1fs elapsed",
+                                rms, AUDIO_RMS_THRESHOLD, elapsed,
+                            )
+                            if notified_waiting and self.on_waiting:
+                                await self.on_waiting("▶️ Audio detected — starting recording now!")
+                            return
+
+                # Send "waiting" notification only after grace period expires
+                if not notified_waiting and (time.monotonic() - start) >= _NOTIFY_GRACE_SECS:
+                    notified_waiting = True
+                    if self.on_waiting:
+                        await self.on_waiting(
+                            "⏸ Joined meeting — waiting for audio to start recording.\n"
+                            "Use /stop to abort."
+                        )
+
+        finally:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except (asyncio.TimeoutError, Exception):
+                pass
+
+    async def _join_google_meet(self, page: Page, url: str) -> None:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        await asyncio.sleep(3)
+        await self._screenshot(page, "01_gmeet_initial")
+
+        # Dismiss "Do you want people to see and hear you?" dialog
+        for _ in range(8):
+            try:
+                if await page.locator('input[placeholder="Your name"]').is_visible():
+                    break
+            except Exception:
+                pass
+            try:
+                btn = page.get_by_text("Continue without microphone and camera", exact=True)
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click()
+                    logger.info("GMeet: dismissed camera/mic dialog")
+                    await asyncio.sleep(2)
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+
+        await self._screenshot(page, "02_gmeet_name")
+
+        # Fill name
+        name_filled = False
+        for sel in ['input[placeholder="Your name"]', 'input[type="text"]']:
+            try:
+                el = page.locator(sel).first
+                if await el.count() > 0 and await el.is_visible():
+                    await el.clear()
+                    await el.fill(self.guest_name)
+                    name_filled = True
+                    logger.info("GMeet: name filled via %s", sel)
+                    break
+            except Exception:
+                continue
+        if not name_filled:
+            logger.warning("GMeet: name field not found")
+
+        # Click "Ask to join" or "Join now"
+        join_clicked = False
+        for label in ("Ask to join", "Join now"):
+            try:
+                btn = page.get_by_text(label, exact=True)
+                if await btn.count() > 0 and await btn.first.is_visible():
+                    await btn.first.click(timeout=5_000)
+                    join_clicked = True
+                    logger.info("GMeet: clicked '%s'", label)
+                    break
+            except Exception:
+                continue
+        if not join_clicked:
+            logger.warning("GMeet: join button not found")
+
+        await asyncio.sleep(3)
+        await self._screenshot(page, "03_gmeet_joining")
+
+        page_text = (await page.evaluate("document.body.innerText")).lower()
+        if "you can't join this video call" in page_text or "cannot join this video call" in page_text:
+            raise RuntimeError(
+                "Google Meet: unable to join this video call. "
+                "The meeting may require a signed-in Google account."
+            )
+        if "meet.google.com" not in page.url:
+            raise RuntimeError(
+                f"Google Meet: join redirected to unexpected page ({page.url!r}). "
+                "Meeting may be invalid, not started, or require a signed-in Google account."
+            )
+
+    async def _watch_google_meet(self, page: Page) -> None:
+        ended_phrases = [
+            "you left the meeting",
+            "this call has ended",
+            "host ended the meeting",
+            "you've been removed",
+            "you were removed",
+            "meeting has ended",
+            "call ended",
+        ]
+        while not self._stop_event.is_set():
+            try:
+                if self._ffmpeg and self._ffmpeg.poll() is not None:
+                    logger.error("FFmpeg exited unexpectedly (code %d)", self._ffmpeg.returncode)
+                    if self.on_error:
+                        await self.on_error(f"FFmpeg stopped unexpectedly (code {self._ffmpeg.returncode})")
+                    return
+                if page.is_closed():
+                    return
+                text = (await page.evaluate("document.body.innerText")).lower()
+                for phrase in ended_phrases:
+                    if phrase in text:
+                        logger.info("GMeet: ended — '%s'", phrase)
+                        return
+                if "meet.google.com" not in page.url:
+                    logger.info("GMeet: left URL: %s", page.url)
+                    return
+            except Exception as e:
+                logger.debug("GMeet watch error: %s", e)
+            await self._dismiss_blocking_dialogs(page)
+            await asyncio.sleep(3)
+
     async def _join_meeting(self, page: Page, web_url: str) -> None:
         await page.goto(web_url, wait_until="domcontentloaded", timeout=30_000)
         await asyncio.sleep(3)
         await self._screenshot(page, "01_initial")
+
+        # Detect invalid / expired meeting before doing anything else
+        page_text = (await page.evaluate("document.body.innerText")).lower()
+        _ERROR_PHRASES = (
+            "this meeting link is invalid",
+            "meeting link is invalid",
+            "invalid meeting",
+            "meeting has ended",
+            "this meeting is for authorized attendees only",
+            "meeting is expired",
+        )
+        for phrase in _ERROR_PHRASES:
+            if phrase in page_text:
+                raise RuntimeError(f"Zoom error on join: {phrase}")
 
         for _ in range(4):
             try:
@@ -400,6 +847,25 @@ class ZoomRecorder:
             except Exception:
                 pass
             await asyncio.sleep(2)
+
+        # Fill passcode if provided — passcode and name fields appear on the same form,
+        # so just fill the value; the existing name-fill + Join button click handles submission.
+        if self.meeting_password:
+            PASSCODE_SELECTORS = [
+                'input[placeholder="Meeting Passcode"]',
+                'input[placeholder="Passcode"]',
+                'input[placeholder="passcode" i]',
+                'input[type="password"]',
+            ]
+            for sel in PASSCODE_SELECTORS:
+                try:
+                    el = page.locator(sel).first
+                    if await el.count() > 0 and await el.is_visible():
+                        await el.fill(self.meeting_password)
+                        logger.info("Passcode filled using: %s", sel)
+                        break
+                except Exception:
+                    continue
 
         NAME_SELECTORS = [
             'input[placeholder="Your Name"]',
@@ -516,8 +982,8 @@ class ZoomRecorder:
                 if "zoom.us/wc" not in page.url:
                     logger.info("Left meeting URL: %s", page.url)
                     return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Watch loop iteration error (will retry): %s", e)
             await self._dismiss_blocking_dialogs(page)
             await asyncio.sleep(3)
 
@@ -547,9 +1013,9 @@ class ZoomRecorder:
         cmd = [
             "ffmpeg", "-y",
             "-loglevel", "warning", "-nostats",
-            "-f", "x11grab", "-r", "25", "-s", "1920x1200", "-i", self.display,
+            "-f", "x11grab", "-r", "24", "-s", "1920x1200", "-i", self.display,
             "-f", "pulse", "-i", self.sink,
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
             "-pix_fmt", "yuv420p",
         ]
         vf = self._build_vf(chrome_height)
@@ -561,13 +1027,13 @@ class ZoomRecorder:
             output,
         ]
         log_path = Path(output).parent / ".ffmpeg.log"
-        ffmpeg_log = open(log_path, "w", encoding="utf-8")
+        self._ffmpeg_log = open(log_path, "w", encoding="utf-8")
         logger.info("FFmpeg log → %s", log_path)
         return subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
-            stdout=ffmpeg_log,
-            stderr=ffmpeg_log,
+            stdout=self._ffmpeg_log,
+            stderr=self._ffmpeg_log,
         )
 
     def _stop_ffmpeg(self) -> None:
@@ -581,4 +1047,10 @@ class ZoomRecorder:
             except (subprocess.TimeoutExpired, BrokenPipeError, OSError):
                 self._ffmpeg.kill()
         self._ffmpeg = None
+        if self._ffmpeg_log:
+            try:
+                self._ffmpeg_log.close()
+            except Exception:
+                pass
+            self._ffmpeg_log = None
         logger.info("FFmpeg stopped")

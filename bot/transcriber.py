@@ -1,13 +1,31 @@
 import asyncio
 import logging
-import os  # for WHISPER_THREADS env var
+import os
 from faster_whisper import WhisperModel
 
 logger = logging.getLogger(__name__)
 
-# Default to 10 threads, leaving 2 cores free for the OS and bot overhead.
-# Override with WHISPER_THREADS env var.
 _CPU_THREADS = int(os.environ.get("WHISPER_THREADS", "10"))
+
+# initial_prompt primes Whisper's context window — teaches spelling of domain terms.
+# hotwords boosts probability of specific words during beam search.
+_DEFAULT_INITIAL_PROMPT = (
+    "Rapat koordinasi pemerintah. Peserta dari BSSN, Direktorat KSS, D32, BSrE, Komdigi, "
+    "Diskominfo, Pemda, Pemprov, Pemkot, Pemkab, Sekda, Dukcapil, DPMPTSP, BKAD, BKPSDM. "
+    "Topik: Pemdigi, Pemdi, IKASANDI, IKAMI, SPBE, TTE, PSrE, NSPK, RKA, KSS, PDP, IPPD, LPPD, "
+    "TTIS, CSIRT, Phising, STR, ComCheck, Sanapati, Forkomsanda, Manrisk, PTKKSS, "
+    "Menpan RB, Kepka, Perka, Perban, Permen, KL, "
+    "verifikasi, self-assessment, tindak lanjut, rekomendasi, email."
+)
+_DEFAULT_HOTWORDS = (
+    "BSSN,BSrE,Komdigi,Kominfo,IKASANDI,IKAMI,Pemdigi,Pemdi,D32,KSS,TTE,SPBE,PSrE,NSPK,RKA,"
+    "PDP,IPPD,LPPD,TTIS,CSIRT,Phising,STR,ComCheck,Sanapati,Forkomsanda,Manrisk,PTKKSS,"
+    "Diskominfo,Pemda,Pemprov,Pemkot,Pemkab,Dukcapil,DPMPTSP,BKAD,BKPSDM,Sekda,"
+    "Menpan,Kepka,Perka,Perban,Permen,KL,email"
+)
+
+WHISPER_INITIAL_PROMPT = os.environ.get("WHISPER_INITIAL_PROMPT", _DEFAULT_INITIAL_PROMPT)
+WHISPER_HOTWORDS = os.environ.get("WHISPER_HOTWORDS", _DEFAULT_HOTWORDS)
 
 _model: WhisperModel | None = None
 _model_name: str | None = None
@@ -50,6 +68,8 @@ def _transcribe_sync(mp4_path: str, model_name: str, language: str | None) -> tu
         mp4_path,
         language=language or None,
         vad_filter=True,
+        initial_prompt=WHISPER_INITIAL_PROMPT or None,
+        hotwords=WHISPER_HOTWORDS or None,
     )
 
     txt_lines: list[str] = []

@@ -1,17 +1,23 @@
+import asyncio
+import json
 import logging
 import os
+import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-import anthropic
+import google.genai as genai
+from google.genai import types
 
 logger = logging.getLogger(__name__)
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "claude-sonnet-4-6")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "gemini-3.5-flash")
+SUMMARY_WEB_SEARCH_MODEL = os.environ.get("SUMMARY_WEB_SEARCH_MODEL", "gemini-2.5-flash")
+SUMMARY_PREPROCESS_MODEL = os.environ.get("SUMMARY_PREPROCESS_MODEL", "gemini-3.1-flash-lite")
 SUMMARY_WEB_SEARCH = os.environ.get("SUMMARY_WEB_SEARCH", "true").lower() not in ("0", "false", "no")
 
-_async_client: anthropic.AsyncAnthropic | None = None
+_client: genai.Client | None = None
 
 SYSTEM_PROMPT = """\
 Kamu adalah ahli dalam membuat ringkasan rapat. Berikan ringkasan yang jelas dan padat \
@@ -29,10 +35,32 @@ Glosarium singkatan yang umum digunakan:
 - BSSN: Badan Siber dan Sandi Negara
 - BSrE: Balai Sertifikasi Elektronik
 - Komdigi: Kementerian Komunikasi dan Digital
+- Kominfo: Kementerian Komunikasi dan Informatika (nama lama Komdigi)
 - PDP: Pelindungan Data Pribadi
 - KSS: Keamanan Siber dan Sandi
+- D32: Direktorat KSS Pemda
+- TTE: Tanda Tangan Elektronik
+- SPBE: Sistem Pemerintahan Berbasis Elektronik
+- Pemdi / Pemdigi: Indeks Pemerintah Digital (penerus SPBE)
+- PSrE: Penyelenggara Sertifikasi Elektronik
+- NSPK: Norma, Standar, Prosedur, dan Kriteria
+- RKA: Rencana Kerja dan Anggaran
 
-Struktur responmu persis seperti ini:
+Rapat kemungkinan dimulai dengan pembukaan formal (sambutan, doa, perkenalan) dan \
+diakhiri dengan penutupan seremonial — abaikan bagian tersebut dan fokus pada substansi \
+pembahasan.
+
+Transkrip mungkin mengandung pengulangan kata, frasa tidak masuk akal, atau teks acak \
+akibat artefak audio di bagian hening — abaikan bagian tersebut.
+
+Jika pengguna memberikan informasi konteks, gunakan sebagai dasar interpretasi dan \
+integrasikan secara natural ke dalam ringkasan.
+
+Mulai responmu SELALU dengan baris ini:
+💭 [Satu kalimat: pemahaman kamu tentang inti rapat, konteks utamanya, dan catatan \
+ambiguitas jika ada]
+
+Lalu beri satu baris kosong, kemudian lanjutkan dengan struktur berikut:
 
 **Tentang Rapat**
 - Rapat apa ini (topik/nama rapat jika disebutkan)
@@ -52,16 +80,37 @@ Struktur responmu persis seperti ini:
 Jaga setiap bagian tetap ringkas. Jangan menambahkan kalimat pengisi yang tidak perlu.\
 """
 
+# Pre-processor prompt — focuses on context gaps and ambiguity, not just acronyms
+_PREPROCESS_PROMPT = """\
+Baca transkrip rapat berikut secara cermat. Identifikasi maksimal 5 hal yang \
+KURANG KONTEKS atau BERPOTENSI AMBIGU yang perlu dikonfirmasi agar ringkasan \
+menjadi akurat dan tidak bias.
+
+Fokus pada:
+- Tujuan atau latar belakang rapat yang tidak dijelaskan dalam transkrip
+- Referensi yang tidak jelas ("proyek itu", "keputusan sebelumnya", "mereka", dll)
+- Pembahasan penting yang setengah-setengah tanpa konteks cukup
+- Peran, jabatan, atau hubungan antar peserta/institusi yang ambigu
+
+PENTING: Kembalikan JSON array saja — tanpa teks, penjelasan, atau markdown \
+apapun sebelum atau sesudah array.
+Contoh output: ["Apa tujuan spesifik koordinasi ini?", "Sistem apa yang dimaksud \
+'aplikasi baru'?", "Timeline yang disebutkan — untuk kegiatan apa?"]
+Jika konteks sudah cukup jelas, kembalikan: []
+
+Transkrip:
+"""
+
 StatusCallback = Callable[[str], Awaitable[None]]
 
 
-def _get_client() -> anthropic.AsyncAnthropic:
-    global _async_client
-    if _async_client is None:
-        if not ANTHROPIC_API_KEY:
-            raise ValueError("ANTHROPIC_API_KEY is not set.")
-        _async_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-    return _async_client
+def _get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        if not GEMINI_API_KEY:
+            raise ValueError("GEMINI_API_KEY is not set.")
+        _client = genai.Client(api_key=GEMINI_API_KEY)
+    return _client
 
 
 async def summarize(
@@ -70,12 +119,11 @@ async def summarize(
     on_status: StatusCallback | None = None,
     on_text_chunk: StatusCallback | None = None,
 ) -> str:
-    """Async streaming summarization with prompt caching.
+    """Async streaming summarization via Gemini with thinking mode.
 
     Callbacks:
-      on_status(text)      — called when a web search starts or text begins after a search
-      on_text_chunk(text)  — called with the accumulated text so far as each delta arrives;
-                             caller is responsible for throttling Telegram edits
+      on_status(text)      — called once before generation starts
+      on_text_chunk(text)  — called with accumulated text as each delta arrives
     """
     client = _get_client()
     text = Path(txt_path).read_text(encoding="utf-8").strip()
@@ -90,78 +138,119 @@ async def summarize(
     else:
         user_content = f"Transkrip:\n\n{text}"
 
-    # ── Prompt caching — system prompt is static, transcript rarely changes ──
-    system_with_cache = [
-        {
-            "type": "text",
-            "text": SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral"},
-        }
-    ]
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": user_content,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-        }
-    ]
+    tools = [types.Tool(google_search=types.GoogleSearch())] if SUMMARY_WEB_SEARCH else []
+    active_model = SUMMARY_WEB_SEARCH_MODEL if SUMMARY_WEB_SEARCH else SUMMARY_MODEL
 
-    create_kwargs: dict = dict(
-        model=SUMMARY_MODEL,
-        max_tokens=2048,
-        system=system_with_cache,
-        messages=messages,
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        max_output_tokens=8192,
+        tools=tools or None,
+        # Thinking mode — internal reasoning improves quality; not shown in output
+        thinking_config=types.ThinkingConfig(thinking_budget=8192),
     )
-    if SUMMARY_WEB_SEARCH:
-        create_kwargs["tools"] = [
-            {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
-        ]
 
     logger.info(
         "Summarizing %s (%d chars) model=%s ctx=%s web_search=%s",
-        txt_path, len(text), SUMMARY_MODEL, bool(user_context), SUMMARY_WEB_SEARCH,
+        txt_path, len(text), active_model, bool(user_context), SUMMARY_WEB_SEARCH,
     )
 
+    # Show initial status
+    if on_status:
+        if SUMMARY_WEB_SEARCH:
+            await on_status("🔍 Mencari informasi di web…")
+        else:
+            await on_status("🧠 Berpikir…")
+
+    # Background ticker — updates draft every 3s during the silent thinking/search phase
+    # so the user sees elapsed time instead of a frozen bubble.
+    loop = asyncio.get_event_loop()
+    start_ts = loop.time()
+    ticker_task: asyncio.Task | None = None
+
+    async def _tick() -> None:
+        while True:
+            await asyncio.sleep(3)
+            if on_status:
+                elapsed = int(loop.time() - start_ts)
+                if SUMMARY_WEB_SEARCH:
+                    await on_status(f"🔍 Mencari informasi di web… ({elapsed}s)")
+                else:
+                    await on_status(f"🧠 Berpikir… ({elapsed}s)")
+
+    if on_status:
+        ticker_task = asyncio.create_task(_tick())
+
     result_parts: list[str] = []
-    search_count = 0
     text_started = False
-    current_block_type: str | None = None
 
-    async with client.messages.stream(**create_kwargs) as stream:
-        async for event in stream:
-            etype = event.type  # type: ignore[attr-defined]
-
-            if etype == "content_block_start":
-                block = event.content_block  # type: ignore[attr-defined]
-                current_block_type = block.type
-
-                if block.type == "tool_use" and getattr(block, "name", "") == "web_search":
-                    search_count += 1
-                    if on_status:
-                        await on_status(f"🔍 Mencari informasi di web… (#{search_count})")
-
-                elif block.type == "text" and not text_started:
+    try:
+        async for chunk in await client.aio.models.generate_content_stream(
+            model=active_model,
+            contents=user_content,
+            config=config,
+        ):
+            if chunk.text:
+                if not text_started:
                     text_started = True
-                    if on_status and search_count > 0:
+                    # Stop ticker — text is flowing now
+                    if ticker_task and not ticker_task.done():
+                        ticker_task.cancel()
+                        ticker_task = None
+                    if on_status:
                         await on_status("✍️ Membuat ringkasan…")
-
-            elif etype == "content_block_delta":
-                delta = event.delta  # type: ignore[attr-defined]
-                if current_block_type == "text" and hasattr(delta, "text"):
-                    result_parts.append(delta.text)
-                    if on_text_chunk:
-                        await on_text_chunk("".join(result_parts))
-
-            elif etype == "content_block_stop":
-                current_block_type = None
+                result_parts.append(chunk.text)
+                if on_text_chunk:
+                    await on_text_chunk("".join(result_parts))
+    finally:
+        if ticker_task and not ticker_task.done():
+            ticker_task.cancel()
 
     return "".join(result_parts)
 
 
+async def extract_context_gaps(txt_path: str) -> list[str]:
+    """Scan transcript for missing context / ambiguities using a cheap fast model.
+
+    Returns up to 5 clarification questions, or [] if context is clear or on any error.
+    Only scans the first 10,000 chars to keep it fast.
+    """
+    if not GEMINI_API_KEY:
+        return []
+    try:
+        text = Path(txt_path).read_text(encoding="utf-8").strip()
+    except Exception:
+        return []
+    if not text:
+        return []
+
+    sample = text[:10_000]
+
+    try:
+        client = _get_client()
+        response = await client.aio.models.generate_content(
+            model=SUMMARY_PREPROCESS_MODEL,
+            contents=_PREPROCESS_PROMPT + sample,
+            config=types.GenerateContentConfig(
+                max_output_tokens=512,
+                temperature=0.1,
+            ),
+        )
+        raw = response.text.strip()
+        logger.info("Context gap raw response: %s", raw[:200])
+        # Strip markdown code fences if model wrapped output
+        clean = re.sub(r'```(?:json)?\s*(.*?)\s*```', r'\1', raw, flags=re.DOTALL).strip()
+        # Greedy match: first '[' to last ']' — handles brackets inside question text
+        match = re.search(r'\[.*\]', clean, re.DOTALL)
+        if match:
+            items = json.loads(match.group())
+            result = [str(q) for q in items[:5] if q]
+            logger.info("Context gaps found: %s", result)
+            return result
+        logger.info("Context gap: no JSON array found in response")
+    except Exception as e:
+        logger.warning("Context gap extraction failed: %s", e)
+    return []
+
+
 def is_configured() -> bool:
-    return bool(ANTHROPIC_API_KEY)
+    return bool(GEMINI_API_KEY)

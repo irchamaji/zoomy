@@ -10,6 +10,7 @@ import re
 import secrets
 import subprocess
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import dateparser as dateparser_lib
@@ -27,7 +28,7 @@ from telegram.ext import (
 import transcriber as transcriber_mod
 import summarizer as summarizer_mod
 
-from recorder import ZoomRecorder, _display_pool
+from recorder import ZoomRecorder, _display_pool, SILENT_SNOOZE_SECS
 from store import RecordingSession, SessionStore
 
 
@@ -62,7 +63,7 @@ AUTHORIZED_IDS = {
     for x in os.environ.get("AUTHORIZED_USER_IDS", "").split(",")
     if x.strip()
 }
-DEFAULT_GUEST_NAME = os.environ.get("GUEST_NAME", "Zoomy")
+DEFAULT_GUEST_NAME = os.environ.get("GUEST_NAME", "zoomy.ircham.dev")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "medium")
 WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "id") or None
 
@@ -77,6 +78,13 @@ DATEPARSER_SETTINGS = {
 
 RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "/recordings"))
 SCHEDULES_FILE = RECORDINGS_DIR / "schedules.json"
+
+
+def _normalize_time_input(text: str) -> str:
+    """Normalize time separators so dateparser handles them correctly.
+    Converts period-separated times like '13.30' or '9.00' to '13:30' / '9:00'.
+    """
+    return re.sub(r'\b(\d{1,2})\.(\d{2})\b', r'\1:\2', text)
 
 
 # ── Schedule file helpers ─────────────────────────────────────────────────────
@@ -140,6 +148,104 @@ def _extract_file_prefix(folder_name: str) -> str:
     m = re.match(r'^(.+)_\d{8}$', folder_name)
     return m.group(1) if m else folder_name
 
+
+async def _resolve_url(url: str) -> str:
+    """Follow HTTP redirects and return the final URL. Returns original on any error."""
+    import urllib.request
+
+    def _follow() -> str:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0 (compatible; ZoomyBot/1.0)"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.url
+
+    try:
+        resolved = await asyncio.to_thread(_follow)
+        if resolved != url:
+            logger.info("URL resolved: %s → %s", url, resolved)
+        return resolved
+    except Exception as e:
+        logger.warning("URL resolution failed for %s: %s", url, e)
+        return url
+
+
+async def _preprocess_input(text: str) -> str:
+    """If input looks like a non-Zoom/Meet URL, follow redirects to find the real URL."""
+    text = text.strip()
+    try:
+        p = urlparse(text)
+        netloc = p.netloc.lower()
+        if (p.scheme in ("http", "https") and netloc
+                and "zoom.us" not in netloc
+                and "meet.google.com" not in netloc):
+            return await _resolve_url(text)
+    except Exception:
+        pass
+    return text
+
+
+def _parse_meeting_input(text: str) -> tuple[str | None, str | None, bool, str | None]:
+    """Parse user input into a normalized meeting URL for Zoom or Google Meet.
+
+    Returns (normalized_url, platform, has_password, error_message).
+    platform is 'zoom' or 'google_meet'. normalized_url is None on error.
+
+    Zoom accepts:
+      - Full URL with pwd: https://zoom.us/j/97856007427?pwd=xxx → has_password=True
+      - Full URL, no pwd:  https://zoom.us/j/97856007427         → has_password=False
+      - Meeting ID only:   97856007427 or 978 5600 7427          → has_password=False
+
+    Google Meet accepts:
+      - https://meet.google.com/xxx-xxxx-xxx
+    """
+    text = text.strip()
+
+    # Google Meet URL
+    try:
+        p = urlparse(text)
+        if "meet.google.com" in p.netloc.lower():
+            path = p.path.strip("/")
+            if re.match(r'^[a-z]+-[a-z]+-[a-z]+$', path):
+                return text, "google_meet", False, None
+            return None, None, False, (
+                "Format Google Meet tidak valid.\n"
+                "Contoh: <code>https://meet.google.com/xxx-xxxx-xxx</code>"
+            )
+    except Exception:
+        pass
+
+    # Zoom — Meeting ID only (9-11 digits, spaces/dashes allowed)
+    meeting_id = re.sub(r'[\s\-]', '', text)
+    if re.fullmatch(r'\d{9,11}', meeting_id):
+        return f"https://zoom.us/j/{meeting_id}", "zoom", False, None
+
+    # Zoom URL
+    try:
+        p = urlparse(text)
+    except Exception:
+        return None, None, False, (
+            "Format tidak dikenali.\n"
+            "Kirim URL Zoom, Meeting ID (9–11 digit), atau URL Google Meet."
+        )
+
+    host = p.netloc.lower()
+    if host == "zoom.us" or host.endswith(".zoom.us"):
+        if not re.search(r'/(?:j|wc)/(\d{9,11})(?:/|$|\?)', p.path):
+            return None, None, False, (
+                "Meeting ID tidak ditemukan dalam URL.\n"
+                "Format yang valid: zoom.us/j/1234567890"
+            )
+        has_pwd = "pwd" in parse_qs(p.query)
+        return text, "zoom", has_pwd, None
+
+    return None, None, False, (
+        "Bukan link Zoom atau Google Meet yang valid.\n"
+        "Kirim URL zoom.us, meeting ID, atau meet.google.com."
+    )
+
+
+
 # ── Scheduled recordings ──────────────────────────────────────────────────────
 
 @dataclass
@@ -163,6 +269,7 @@ async def _transcription_worker(bot) -> None:
         is_retranscribe = session_key.startswith("retranscribe/")
         label = session_key[len("retranscribe/"):] if is_retranscribe else f"Session {session_key}"
         verb = "Retranscribing" if is_retranscribe else "Transcribing"
+
         await bot.send_message(chat_id, f"{verb} {label} ({model})…")
         try:
             txt, srt = await transcriber_mod.transcribe(mp4_path, model, WHISPER_LANGUAGE)
@@ -207,10 +314,10 @@ async def _transcribe_timeout(session_key: str, mp4_path: str, chat_id: int, bot
     await asyncio.sleep(100)
     if session_key in _pending_transcriptions:
         _pending_transcriptions.pop(session_key)
-        await _transcription_queue.put((mp4_path, chat_id, session_key, "medium"))
+        await _transcription_queue.put((mp4_path, chat_id, session_key, WHISPER_MODEL))
         await bot.send_message(
             chat_id,
-            f"Auto-transcribing session {session_key} (medium). {_queue_status_str()}"
+            f"Auto-transcribing session {session_key} ({WHISPER_MODEL}). {_queue_status_str()}"
         )
 
 
@@ -219,12 +326,16 @@ async def _handle_transcribe_callback(update: Update, context: ContextTypes.DEFA
     await query.answer()
     action, session_key = query.data.split(":", 1)
 
-    if action in ("transcribe_medium", "transcribe_large"):
+    _MODEL_MAP = {
+        "transcribe_medium": "medium",
+        "transcribe_large":  "large-v3",
+    }
+    if action in _MODEL_MAP:
         mp4_path = _pending_transcriptions.pop(session_key, None)
         if not mp4_path:
             await query.edit_message_text(query.message.text + "\n\n⚠️ Request expired.")
             return
-        model = "medium" if action == "transcribe_medium" else "large-v3"
+        model = _MODEL_MAP[action]
         await _transcription_queue.put((mp4_path, query.message.chat_id, session_key, model))
         await query.edit_message_text(
             query.message.text + f"\n\nTranscription ({model}): {_queue_status_str()}"
@@ -290,22 +401,42 @@ async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     url = context.args[0] if context.args else None
     active = store.active(user_id)
 
-    if url and any(s.url == url for s in active):
-        await update.message.reply_text("Already recording this meeting.")
-        return
+    raw = context.args[0] if context.args else None
+
+    if raw:
+        raw = await _preprocess_input(raw)
+        normalized_url, platform, has_pwd, err = _parse_meeting_input(raw)
+        if err:
+            await update.message.reply_text(f"⚠️ {err}", parse_mode="HTML")
+            return
+        url = normalized_url
+        if any(s.url == url for s in active):
+            await update.message.reply_text("Already recording this meeting.")
+            return
+    else:
+        url = None
+        platform = None
 
     store.set_pending(user_id, {
         "url": url,
+        "platform": platform,
         "guest_name": DEFAULT_GUEST_NAME,
         "resolution": "1080p",
         "state": None,
         "timeout_task": None,
     })
 
-    # No URL provided — ask for it
+    # No input provided — ask for it
     if not url:
         store.update_pending(user_id, state="input_url")
-        await update.message.reply_text("Send me the Zoom URL: (100s timeout)")
+        await update.message.reply_text(
+            "Kirim Zoom URL atau Meeting ID: (100s timeout)\n\n"
+            "Contoh:\n"
+            "• <code>https://zoom.us/j/97856007427?pwd=xxx</code>\n"
+            "• <code>https://zoom.us/j/97856007427</code>\n"
+            "• <code>97856007427</code>",
+            parse_mode="HTML",
+        )
         task = asyncio.create_task(_url_timeout(user_id, context.bot))
         store.update_pending(user_id, timeout_task=task)
         return
@@ -322,6 +453,10 @@ async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
+    if not has_pwd and platform == "zoom":
+        await _ask_meeting_password(user_id, context.bot)
+        return
+
     await _send_name_keyboard(user_id, context.bot)
 
 
@@ -330,6 +465,41 @@ async def _url_timeout(user_id: int, bot) -> None:
     if store.get_pending(user_id).get("state") == "input_url":
         store.pop_pending(user_id)
         await bot.send_message(user_id, "Timed out — no URL received. Send /record to try again.")
+
+
+async def _ask_meeting_password(user_id: int, bot) -> None:
+    _cancel_timeout(user_id)
+    store.update_pending(user_id, state="input_pwd")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Skip", callback_data="skip_pwd")]])
+    await bot.send_message(
+        user_id,
+        "🔑 URL tidak menyertakan password. Kirim password meeting-nya, "
+        "atau tekan <b>Skip</b> jika tidak ada. (100s timeout)",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+    task = asyncio.create_task(_pwd_timeout(user_id, bot))
+    store.update_pending(user_id, timeout_task=task)
+
+
+async def _pwd_timeout(user_id: int, bot) -> None:
+    await asyncio.sleep(100)
+    if store.get_pending(user_id).get("state") == "input_pwd":
+        store.update_pending(user_id, state=None)
+        await bot.send_message(user_id, "Timed out — proceeding without password.")
+        await _send_name_keyboard(user_id, bot)
+
+
+async def cb_skip_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if store.get_pending(user_id).get("state") != "input_pwd":
+        return
+    _cancel_timeout(user_id)
+    store.update_pending(user_id, state=None)
+    await query.edit_message_text("No password — proceeding.")
+    await _send_name_keyboard(user_id, context.bot)
 
 
 async def _send_name_keyboard(user_id: int, bot) -> None:
@@ -353,7 +523,7 @@ async def _name_timeout(user_id: int, bot) -> None:
     if store.get_pending(user_id).get("state") == "waiting_name":
         store.update_pending(user_id, state=None)
         await bot.send_message(user_id, f"No response — using {DEFAULT_GUEST_NAME}.")
-        await _ask_resolution(user_id, bot)
+        await _ask_recording_name(user_id, bot)
 
 
 # ── Concurrent session confirmation ───────────────────────────────────────────
@@ -473,15 +643,19 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     state = store.get_pending(user_id).get("state")
 
     if state == "input_url":
-        url = update.message.text.strip()
+        raw_input = await _preprocess_input(update.message.text)
+        normalized_url, platform, has_pwd, err = _parse_meeting_input(raw_input)
+        if err:
+            await update.message.reply_text(f"⚠️ {err}\n\nCoba kirim lagi:", parse_mode="HTML")
+            return  # keep state + timeout running so user can retry
         _cancel_timeout(user_id)
         active = store.active(user_id)
-        if any(s.url == url for s in active):
+        if any(s.url == normalized_url for s in active):
             store.pop_pending(user_id)
             await update.message.reply_text("Already recording this meeting.")
             return
-        store.update_pending(user_id, url=url, state=None)
-        await update.message.reply_text(f"URL received.")
+        store.update_pending(user_id, url=normalized_url, platform=platform, state=None)
+        await update.message.reply_text("✅ Diterima.")
         if active:
             lines = "\n".join(f"• {_session_label(s)}" for s in active)
             kb = InlineKeyboardMarkup([[
@@ -494,6 +668,16 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup=kb,
             )
             return
+        if not has_pwd and platform == "zoom":
+            await _ask_meeting_password(user_id, context.bot)
+            return
+        await _send_name_keyboard(user_id, context.bot)
+
+    elif state == "input_pwd":
+        pwd = update.message.text.strip()
+        _cancel_timeout(user_id)
+        store.update_pending(user_id, meeting_password=pwd, state=None)
+        await update.message.reply_text("🔑 Password diterima.")
         await _send_name_keyboard(user_id, context.bot)
 
     elif state == "input_name":
@@ -510,7 +694,7 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _ask_start_or_schedule(user_id, context.bot)
 
     elif state == "input_schedule_time":
-        text = update.message.text.strip()
+        text = _normalize_time_input(update.message.text.strip())
         dt = dateparser_lib.parse(text, settings=DATEPARSER_SETTINGS)
         if not dt:
             await update.message.reply_text(
@@ -641,6 +825,7 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
     guest_name = p.get("guest_name", DEFAULT_GUEST_NAME)
     prefix = p.get("prefix")
     resolution = p.get("resolution", "1080p")
+    meeting_password = p.get("meeting_password")
 
     if not url:
         await bot.send_message(chat_id, "Error: no URL found.")
@@ -666,21 +851,27 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
             chat_id,
             f"Recording started — Session {session_num}\nFolder: {folder}",
         )
+        session = store.find(user_id, session_num)
+        if session:
+            await _send_peek(session, chat_id, bot)
 
     async def on_stopped(filename: str, duration: str, size: str, auto_ended: bool = False) -> None:
         folder = Path(filename).parent.name
         reason = "Meeting ended by host" if auto_ended else "Stopped manually"
         session_key = str(session_num)
         _pending_transcriptions[session_key] = filename
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🎙 Medium", callback_data=f"transcribe_medium:{session_key}"),
-            InlineKeyboardButton("🎙 Large",  callback_data=f"transcribe_large:{session_key}"),
-            InlineKeyboardButton("Skip",      callback_data=f"skip:{session_key}"),
-        ]])
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🎙 Medium", callback_data=f"transcribe_medium:{session_key}"),
+                InlineKeyboardButton("🎙 Large",  callback_data=f"transcribe_large:{session_key}"),
+            ],
+            [InlineKeyboardButton("Skip", callback_data=f"skip:{session_key}")],
+        ])
         await bot.send_message(
             chat_id,
             f"Recording saved — Session {session_num}\n"
             f"Folder: {folder}\nDuration: {duration}\nSize: {size}\nReason: {reason}\n\n"
+            f"Recording can be viewed at file.ircham.dev\n\n"
             f"Transcribe with Whisper? (auto-transcribes with Medium in 100s)",
             reply_markup=keyboard,
         )
@@ -691,9 +882,39 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
 
     async def on_dialog(dialog_text: str) -> None:
         short = dialog_text[:300].strip()
+        if len(short) < 10 or short.lower() == "notification":
+            return
         await bot.send_message(
             chat_id,
             f"ℹ️ <b>Session {session_num} — dialog dismissed:</b>\n<i>{html.escape(short)}</i>",
+            parse_mode="HTML",
+        )
+
+    async def on_waiting(msg: str) -> None:
+        await bot.send_message(chat_id, f"⏸ Session {session_num} — {msg}")
+
+    async def on_silence_warn(duration: int) -> None:
+        name = html.escape(recorder.recording_prefix or "recording")
+        snooze_mins = SILENT_SNOOZE_SECS // 60
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"💤 Remind me in {snooze_mins}m",    callback_data=f"silence_snooze:{session_num}")],
+            [InlineKeyboardButton("🔔 Alert when audio returns",         callback_data=f"silence_wait:{session_num}")],
+            [InlineKeyboardButton("⏹ Stop recording",                   callback_data=f"stop_session_{session_num}")],
+        ])
+        await bot.send_message(
+            chat_id,
+            f"🔇 <b>Session {session_num} — {name}</b>\n"
+            f"Zoom meeting room is silent for <b>{duration}s</b> — still recording.",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+
+    async def on_audio_returned() -> None:
+        name = html.escape(recorder.recording_prefix or "recording")
+        await bot.send_message(
+            chat_id,
+            f"🔊 <b>Session {session_num} — {name}</b>\n"
+            f"Audio detected — recording is active.",
             parse_mode="HTML",
         )
 
@@ -703,10 +924,14 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
         guest_name=guest_name,
         recording_prefix=prefix,
         resolution=resolution,
+        meeting_password=meeting_password,
         on_started=on_started,
         on_stopped=on_stopped,
         on_error=on_error,
         on_dialog=on_dialog,
+        on_waiting=on_waiting,
+        on_silence_warn=on_silence_warn,
+        on_audio_returned=on_audio_returned,
     )
 
     async def _hourly_warning() -> None:
@@ -848,7 +1073,7 @@ async def _handle_reschedule_input(update: Update, context: ContextTypes.DEFAULT
     if not state:
         return
 
-    text = update.message.text.strip()
+    text = _normalize_time_input(update.message.text.strip())
     dt = dateparser_lib.parse(text, settings=DATEPARSER_SETTINGS)
     if not dt:
         await update.message.reply_text(
@@ -1152,6 +1377,45 @@ async def cb_stop_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await query.edit_message_text(f"Stopping all {len(active)} session(s)...")
 
 
+# ── Silence-warning callbacks ─────────────────────────────────────────────────
+
+async def cb_silence_snooze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    session_num = int(query.data.split(":")[1])
+    session = store.find(user_id, session_num)
+    if not session:
+        await query.edit_message_text(query.message.text + "\n\n⚠️ Session not found.")
+        return
+    session.recorder.silence_snooze()
+    snooze_mins = SILENT_SNOOZE_SECS // 60
+    name = html.escape(session.recorder.recording_prefix or "recording")
+    await query.edit_message_text(
+        f"💤 <b>Session {session_num} — {name}</b>\n"
+        f"Snoozed for {snooze_mins}min — still recording.",
+        parse_mode="HTML",
+    )
+
+
+async def cb_silence_wait(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    session_num = int(query.data.split(":")[1])
+    session = store.find(user_id, session_num)
+    if not session:
+        await query.edit_message_text(query.message.text + "\n\n⚠️ Session not found.")
+        return
+    session.recorder.silence_wait_for_audio()
+    name = html.escape(session.recorder.recording_prefix or "recording")
+    await query.edit_message_text(
+        f"⏸ <b>Session {session_num} — {name}</b>\n"
+        f"Waiting for audio to return… Recording continues.",
+        parse_mode="HTML",
+    )
+
+
 # ── /ongoing ──────────────────────────────────────────────────────────────────
 
 async def cmd_ongoing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1256,8 +1520,9 @@ def _mid_truncate(s: str, max_len: int) -> str:
     return s[:half] + "…" + s[-(max_len - half - 1):]
 
 
+
 async def _summary_ctx_timeout(user_id: int, bot, chat_id: int, message_id: int) -> None:
-    await asyncio.sleep(120)
+    await asyncio.sleep(3600)  # 1 hour
     if _pending_summary_context.pop(user_id, None) is not None:
         try:
             await bot.edit_message_text(
@@ -1603,6 +1868,13 @@ _DRAFT_THROTTLE = 0.15   # seconds between sendMessageDraft calls (no documented
                           # but throttle slightly to avoid hammering Telegram)
 
 
+def _md_escape_name(name: str) -> str:
+    """Escape folder-name chars that break Telegram Markdown V1 formatting."""
+    for ch in r"_*`[":
+        name = name.replace(ch, f"\\{ch}")
+    return name
+
+
 async def _send_summary(
     chat_id: int,
     folder_name: str,
@@ -1622,13 +1894,12 @@ async def _send_summary(
     import random
 
     summary_path = txt_path.parent / ".summary.txt"
-    escaped_name = html.escape(folder_name)
-    header = f"🤖 <b>AI Summary — {escaped_name}</b>\n\n"
+    header = f"🤖 *AI Summary — {_md_escape_name(folder_name)}*\n\n"
 
     # ── Cached path ──────────────────────────────────────────────────────────
     if not user_context and summary_path.exists():
         summary = summary_path.read_text(encoding="utf-8")
-        full_text = header + "<i>(cached)</i>\n\n" + html.escape(summary)
+        full_text = header + "_(cached)_\n\n" + summary
         await _deliver_summary(chat_id, full_text, txt_path, bot)
         return
 
@@ -1647,7 +1918,7 @@ async def _send_summary(
                 chat_id=chat_id,
                 draft_id=draft_id,
                 text=text,
-                parse_mode="HTML",
+                parse_mode="Markdown",
             )
             last_draft_ts = now
         except Exception:
@@ -1657,7 +1928,7 @@ async def _send_summary(
         await _push_draft(header + status_text)
 
     async def on_text_chunk(accumulated: str) -> None:
-        await _push_draft(header + html.escape(accumulated))
+        await _push_draft(header + accumulated)
 
     # Show initial "starting" bubble right away
     await _push_draft(header + "⏳ Memulai…")
@@ -1682,15 +1953,15 @@ async def _send_summary(
         logger.warning("Could not save summary file: %s", e)
 
     # Finalise: send_message dismisses the draft bubble and delivers the real message
-    full_text = header + html.escape(summary)
+    full_text = header + summary
     if len(full_text) <= 4096:
-        await bot.send_message(chat_id, full_text, parse_mode="HTML")
+        await bot.send_message(chat_id, full_text, parse_mode="Markdown")
     else:
         chunks = [full_text[i:i + 4000] for i in range(0, len(full_text), 4000)]
         for i, chunk in enumerate(chunks):
             if i > 0:
-                chunk = f"<i>(continued…)</i>\n\n{chunk}"
-            await bot.send_message(chat_id, chunk, parse_mode="HTML")
+                chunk = f"_(continued…)_\n\n{chunk}"
+            await bot.send_message(chat_id, chunk, parse_mode="Markdown")
 
     # Follow-up: offer to send full transcript
     token_send = secrets.token_hex(8)
@@ -1707,13 +1978,13 @@ async def _send_summary(
 async def _deliver_summary(chat_id: int, full_text: str, txt_path: Path, bot) -> None:
     """Send a pre-built summary string and follow-up transcript button."""
     if len(full_text) <= 4096:
-        await bot.send_message(chat_id, full_text, parse_mode="HTML")
+        await bot.send_message(chat_id, full_text, parse_mode="Markdown")
     else:
         chunks = [full_text[i:i + 4000] for i in range(0, len(full_text), 4000)]
         for i, chunk in enumerate(chunks):
             if i > 0:
-                chunk = f"<i>(continued…)</i>\n\n{chunk}"
-            await bot.send_message(chat_id, chunk, parse_mode="HTML")
+                chunk = f"_(continued…)_\n\n{chunk}"
+            await bot.send_message(chat_id, chunk, parse_mode="Markdown")
 
     token_send = secrets.token_hex(8)
     _pending_send_transcript[token_send] = str(txt_path)
@@ -1737,26 +2008,42 @@ _SUMMARY_CTX_PROMPT = (
 )
 
 
-def _ask_summary_context(user_id: int, txt_path: Path, folder_name: str, chat_id: int, bot):
-    """Send the context-input prompt and register pending state with a 120s timeout."""
+async def _ask_summary_context(user_id: int, txt_path: Path, folder_name: str, chat_id: int, bot) -> None:
+    """Pre-process transcript for unknown terms, then send context-input prompt."""
+    # Pre-process: scan for context gaps with cheap model (fast, ~1–2s)
+    context_gaps: list[str] = []
+    try:
+        context_gaps = await summarizer_mod.extract_context_gaps(str(txt_path))
+    except Exception as e:
+        logger.warning("Context gap extraction failed for %s: %s", txt_path, e)
+
+    # Build prompt — prepend detected gaps as clarification questions if any
+    if context_gaps:
+        bullets = "\n".join(f"• {q}" for q in context_gaps)
+        prompt = (
+            f"💭 <b>Beberapa hal yang perlu dikonfirmasi dari transkrip:</b>\n{bullets}\n\n"
+            "📋 <b>Berikan konteks tentang meeting ini</b> (opsional, tapi sangat membantu AI):\n\n"
+            "• Jawab pertanyaan di atas jika kamu tahu\n"
+            "• Tambahkan konteks lain yang relevan\n\n"
+            "Ketik, atau tekan <b>Skip</b> untuk langsung generate."
+        )
+    else:
+        prompt = _SUMMARY_CTX_PROMPT
+
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("⏭ Skip", callback_data="summary_ctx_skip"),
     ]])
-
-    async def _send_and_track():
-        msg = await bot.send_message(chat_id, _SUMMARY_CTX_PROMPT, parse_mode="HTML", reply_markup=kb)
-        state = {
-            "txt_path": txt_path,
-            "folder_name": folder_name,
-            "chat_id": chat_id,
-            "prompt_msg_id": msg.message_id,
-        }
-        _pending_summary_context[user_id] = state
-        state["timeout_task"] = asyncio.create_task(
-            _summary_ctx_timeout(user_id, bot, chat_id, msg.message_id)
-        )
-
-    return _send_and_track()
+    msg = await bot.send_message(chat_id, prompt, parse_mode="HTML", reply_markup=kb)
+    state = {
+        "txt_path": txt_path,
+        "folder_name": folder_name,
+        "chat_id": chat_id,
+        "prompt_msg_id": msg.message_id,
+    }
+    _pending_summary_context[user_id] = state
+    state["timeout_task"] = asyncio.create_task(
+        _summary_ctx_timeout(user_id, bot, chat_id, msg.message_id)
+    )
 
 
 async def cb_rt_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1829,8 +2116,8 @@ async def cb_rt_send_summary(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await query.edit_message_text(f"📁 <b>{html.escape(folder_name)}</b>", parse_mode="HTML")
 
-    header = f"🤖 <b>AI Summary — {html.escape(folder_name)}</b> <i>(cached)</i>\n\n"
-    full_text = header + html.escape(summary)
+    header = f"🤖 *AI Summary — {_md_escape_name(folder_name)}* _(cached)_\n\n"
+    full_text = header + summary
     await _deliver_summary(query.message.chat_id, full_text, txt_path, context.bot)
 
 
@@ -2115,6 +2402,24 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+_HELP_TEXT = (
+    "🎙 <b>Zoomy — Zoom Meeting Recorder</b>\n\n"
+    "<b>Commands:</b>\n"
+    "/record — Start recording a Zoom meeting\n"
+    "/stop — Stop the active recording\n"
+    "/peek — Screenshot of the active meeting\n"
+    "/schedule — View, reschedule, or cancel scheduled recordings\n"
+    "/status — Active count + total across all users\n"
+    "/history — Browse recordings; transcribe, rename, or AI summary"
+)
+
+
+async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        return
+    await update.message.reply_text(_HELP_TEXT, parse_mode="HTML")
+
+
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled exception in handler", exc_info=context.error)
 
@@ -2217,8 +2522,34 @@ def _cancel_reschedule_timeout(user_id: int) -> None:
         t.cancel()
 
 
+def _spawn_transcription_worker(bot) -> None:
+    """Create the transcription worker task with an auto-restart done-callback.
+
+    If the task exits for any reason other than explicit cancellation (bot
+    shutdown), it is automatically restarted.  Cancelled tasks are left alone
+    so a clean shutdown doesn't loop forever.
+    """
+    task = asyncio.create_task(_transcription_worker(bot))
+
+    def _on_worker_done(t: asyncio.Task) -> None:
+        if t.cancelled():
+            logger.info("Transcription worker cancelled — not restarting")
+            return
+        exc = t.exception()
+        if exc:
+            logger.error(
+                "Transcription worker crashed — restarting",
+                exc_info=exc,
+            )
+        else:
+            logger.warning("Transcription worker exited cleanly — restarting")
+        _spawn_transcription_worker(bot)
+
+    task.add_done_callback(_on_worker_done)
+
+
 async def _post_init(application: Application) -> None:
-    asyncio.create_task(_transcription_worker(application.bot))
+    _spawn_transcription_worker(application.bot)
     await _restore_schedules(application.bot)
     _cleanup_stale_wavs()
 
@@ -2276,14 +2607,18 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_cancel_new_session,  pattern="^cancel_new_session$"))
     app.add_handler(CallbackQueryHandler(cb_use_default,         pattern="^use_default$"))
     app.add_handler(CallbackQueryHandler(cb_change_name,         pattern="^change_name$"))
+    app.add_handler(CallbackQueryHandler(cb_skip_pwd,             pattern="^skip_pwd$"))
     app.add_handler(CallbackQueryHandler(cb_skip_rec_name,       pattern="^skip_rec_name$"))
     app.add_handler(CallbackQueryHandler(cb_peek_session,        pattern=r"^peek_session_(\d+)$"))
     app.add_handler(CallbackQueryHandler(cb_peek_all,            pattern="^peek_all_sessions$"))
     app.add_handler(CallbackQueryHandler(cb_stop_session,        pattern=r"^stop_session_(\d+)$"))
     app.add_handler(CallbackQueryHandler(cb_stop_all,            pattern="^stop_all_sessions$"))
-    app.add_handler(CallbackQueryHandler(cb_cancel_stop,              pattern="^cancel_stop$"))
+    app.add_handler(CallbackQueryHandler(cb_cancel_stop,         pattern="^cancel_stop$"))
+    app.add_handler(CallbackQueryHandler(cb_silence_snooze,      pattern=r"^silence_snooze:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_silence_wait,        pattern=r"^silence_wait:\d+$"))
     app.add_handler(CallbackQueryHandler(_handle_transcribe_callback, pattern=r"^(transcribe_medium|transcribe_large|skip):"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
+    app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))  # catch-all — must be last
     logger.info("Zoomy bot started (@baboonrecord_bot)")
     app.run_polling(drop_pending_updates=True)
 
