@@ -1,9 +1,25 @@
 services:
+  cli-proxy-api:
+    image: eceasy/cli-proxy-api:latest
+    container_name: zoomy-cli-proxy-api
+    restart: unless-stopped
+    volumes:
+      - ./cli-proxy/config.yaml:/CLIProxyAPI/config.yaml:ro
+      - ./cli-proxy/auths:/root/.cli-proxy-api
+
   zoomy:
     build: ./bot
     container_name: zoomy
     restart: unless-stopped
     env_file: .env
+    depends_on:
+      - cli-proxy-api
     volumes:
       - ./recordings:/recordings
+      # Saved Zoom login (see bot/zoom_login.py) for hosts that require
+      # signed-in participants. Mounted as a directory so a missing
+      # zoom_state.json stays missing — Docker would turn a bind mount of an
+      # absent *file* into an empty directory of that name. Read-only: the bot
+      # only ever loads it.
+      - ./secrets:/secrets:ro
     shm_size: "2gb"

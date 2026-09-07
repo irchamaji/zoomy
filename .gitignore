@@ -1,6 +1,15 @@
 # secrets
 .env
 
+# saved Zoom login (bot/zoom_login.py) — a live session, never commit
+secrets/*
+!secrets/.gitkeep
+
+# CLIProxyAPI OAuth refresh tokens and local runtime configuration
+cli-proxy/auths/*
+!cli-proxy/auths/.gitkeep
+cli-proxy/config.yaml
+
 # recordings output — keep the placeholder
 recordings/*
 !recordings/.gitkeep

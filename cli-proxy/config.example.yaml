@@ -1,0 +1,32 @@
+# Kept on the internal Docker network only. Do not publish port 8317.
+host: "0.0.0.0"
+port: 8317
+
+remote-management:
+  allow-remote: false
+  secret-key: ""
+  disable-control-panel: true
+
+auth-dir: "~/.cli-proxy-api"
+
+# Copy this file to cli-proxy/config.yaml and replace this value with the same
+# random secret assigned to CLIPROXY_API_KEY in .env.
+api-keys:
+  - "replace-with-a-long-random-internal-secret"
+
+debug: false
+logging-to-file: false
+usage-statistics-enabled: false
+
+# One ChatGPT OAuth account is shared by the two private Zoomy users. Affinity
+# keeps every Telegram conversation on that account if more credentials are added.
+routing:
+  strategy: "round-robin"
+  session-affinity: true
+  session-affinity-ttl: "2h"
+
+codex:
+  stream-bootstrap-buffering: true
+
+# Zoomy only needs text and web search. Avoid injecting the Codex image tool.
+disable-image-generation: true
