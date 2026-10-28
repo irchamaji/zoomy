@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 
 from recorder import ZoomRecorder
 
@@ -69,4 +70,14 @@ class SessionStore:
             (s for s in self._sessions.get(user_id, [])
              if s.session_num == session_num and s.recorder.is_recording),
             None,
+        )
+
+    def is_active_folder(self, folder: Path) -> bool:
+        """Return whether a live recorder currently writes into this folder."""
+        return any(
+            s.recorder.is_recording
+            and s.recorder.output_path
+            and s.recorder.output_path.parent == folder
+            for sessions in self._sessions.values()
+            for s in sessions
         )

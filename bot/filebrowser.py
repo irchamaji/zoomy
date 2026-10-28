@@ -6,6 +6,11 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Master switch, off by default: recordings now go to YouTube and the local folder
+# is deleted after a week, so a share link to the local file would soon go dead.
+# The URL/token below stay configured so the feature can be turned back on by
+# setting FILEBROWSER_ENABLED=true.
+FILEBROWSER_ENABLED = os.environ.get("FILEBROWSER_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 FILEBROWSER_URL = os.environ.get("FILEBROWSER_URL", "").rstrip("/")
 FILEBROWSER_API_TOKEN = os.environ.get("FILEBROWSER_API_TOKEN", "")
 FILEBROWSER_SOURCE_NAME = os.environ.get("FILEBROWSER_SOURCE_NAME", "recordings")
@@ -35,7 +40,7 @@ async def create_share(relative_path: str) -> tuple[str, datetime]:
     as a timezone-aware UTC datetime, taken from the server's response.
     """
     if not is_configured():
-        raise ValueError("FILEBROWSER_URL / FILEBROWSER_API_TOKEN not set.")
+        raise ValueError("FileBrowser share links are disabled (FILEBROWSER_ENABLED) or FILEBROWSER_URL / FILEBROWSER_API_TOKEN not set.")
 
     path = "/" + relative_path.lstrip("/")
     client = _get_client()
@@ -68,4 +73,4 @@ async def create_share(relative_path: str) -> tuple[str, datetime]:
 
 
 def is_configured() -> bool:
-    return bool(FILEBROWSER_URL and FILEBROWSER_API_TOKEN)
+    return bool(FILEBROWSER_ENABLED and FILEBROWSER_URL and FILEBROWSER_API_TOKEN)

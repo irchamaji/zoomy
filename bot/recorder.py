@@ -386,6 +386,49 @@ _DISMISS_JS = "() => {" + _FIND_BREAKOUT_FN + """
                     }
                 }
 
+                // Pass 3: feature-intro popovers ("Introducing My Notes" → "Got it").
+                // These are position:fixed and don't carry modal/dialog classes, so
+                // passes 1-2 miss them (offsetParent is null for fixed elements).
+                for (const btn of clickables(document)) {
+                    if (guarded(btn) || !_visible(btn)) continue;
+                    if (_label(btn) !== 'got it') continue;
+                    const text = describe(btn) || 'Got it popup';
+                    btn.click();
+                    return text;
+                }
+
+                // Pass 4: toast banners whose only control is a bare close icon
+                // (e.g. "enable hardware acceleration ... Learn more  ×"). Anchor on
+                // the toast text, then look for an icon-only/close-ish button in the
+                // nearest ancestors.
+                const TOAST_HINTS = ['hardware acceleration'];
+                const isCloseish = btn => {
+                    const lbl = _label(btn);
+                    if (lbl.includes('learn more')) return false;
+                    if (['x', '×', '✕', '✖', 'close', 'dismiss'].includes(lbl)) return true;
+                    const meta = ((btn.getAttribute('aria-label') || '') + ' '
+                                  + (btn.getAttribute('title') || '') + ' '
+                                  + (btn.getAttribute('class') || '')).toLowerCase();
+                    if (meta.includes('close') || meta.includes('dismiss')) return true;
+                    return !lbl && !!btn.querySelector('svg, i, img');
+                };
+                for (const node of document.querySelectorAll('div, span, p')) {
+                    if (node.children.length > 3) continue;
+                    const nt = (node.innerText || '').replace(/\\s+/g, ' ').trim();
+                    if (!nt || nt.length > 300) continue;
+                    const low = nt.toLowerCase();
+                    if (!TOAST_HINTS.some(h => low.includes(h)) || !_visible(node)) continue;
+                    let el = node;
+                    for (let d = 0; el && d < 5; d++, el = el.parentElement) {
+                        if (breakout && el.contains(breakout)) break;
+                        const btn = clickables(el).find(b => !guarded(b) && _visible(b) && isCloseish(b));
+                        if (btn) {
+                            btn.click();
+                            return nt;
+                        }
+                    }
+                }
+
                 return null;
         }"""
 
@@ -398,6 +441,7 @@ class ZoomRecorder:
         self,
         display: str = ":99",
         sink: str = "virtual.monitor",
+        user_id: int | None = None,
         guest_name: str = GUEST_NAME,
         recording_prefix: Optional[str] = None,
         resolution: str = "1080p",
@@ -414,6 +458,7 @@ class ZoomRecorder:
         on_breakout_result: Optional[Callback] = None,
     ):
         self.display = display
+        self.user_id = user_id
         # `sink` is the monitor source FFmpeg records from ("virtual_99.monitor");
         # `sink_name` is the sink itself ("virtual_99"), which is what Chrome must
         # be pointed at via PULSE_SINK so its audio lands where we record.
@@ -610,6 +655,9 @@ class ZoomRecorder:
 
         except Exception as exc:
             logger.exception("Recorder failed")
+            # Prevent the finalizer from reporting a partially-created output
+            # as a successful recording after a runtime or encoder failure.
+            self._session_errored = True
             if self.on_error:
                 await self.on_error(str(exc))
         finally:
@@ -623,6 +671,7 @@ class ZoomRecorder:
 
             if self.output_path and not self._session_errored:
                 metadata = {
+                    "user_id": self.user_id,
                     "recording_name": self.recording_prefix,
                     "url": url,
                     "duration_seconds": elapsed,
@@ -1373,6 +1422,8 @@ class ZoomRecorder:
                 # FFmpeg health check — if process exited, encoding stopped
                 if not self._paused and self._ffmpeg and self._ffmpeg.poll() is not None:
                     logger.error("FFmpeg exited unexpectedly (code %d)", self._ffmpeg.returncode)
+                    self._session_errored = True
+                    self._stop_event.set()
                     try:
                         if self.on_error:
                             await self.on_error(f"FFmpeg stopped unexpectedly (code {self._ffmpeg.returncode})")

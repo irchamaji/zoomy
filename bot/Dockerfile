@@ -47,7 +47,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+# Ubuntu 22.04 ships pip 22.0.2, which crashes (AssertionError in the resolver)
+# on some dependency graphs; upgrade it before resolving.
+RUN pip3 install --no-cache-dir -U pip \
+    && pip3 install --no-cache-dir -r requirements.txt
 RUN playwright install chromium
 RUN playwright install-deps chromium
 

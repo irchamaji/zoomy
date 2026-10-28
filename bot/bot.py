@@ -7,6 +7,7 @@ import logging
 import logging.handlers
 import os
 import random
+import shutil
 import re
 import secrets
 import subprocess
@@ -30,6 +31,7 @@ from telegram.ext import (
 import transcriber as transcriber_mod
 import summarizer as summarizer_mod
 import filebrowser as filebrowser_mod
+import youtube as youtube_mod
 
 from recorder import ZoomRecorder, _display_pool, SILENT_SNOOZE_SECS, BREAKOUT_AUTOJOIN_SECS
 from store import RecordingSession, SessionStore
@@ -136,6 +138,8 @@ _transcription_queue: asyncio.Queue = asyncio.Queue()
 _transcription_busy: bool = False          # True while worker is actively transcribing
 _pending_transcriptions: dict[str, str] = {}  # session_key → mp4_path
 _pending_send_transcript: dict[str, str] = {}  # token → txt_path
+_pending_youtube_retry: dict[str, str] = {}  # token → mp4_path of a failed upload
+_background_tasks: set[asyncio.Task] = set()  # strong refs so fire-and-forget tasks aren't GC'd
 _pending_summarize_txt: dict[str, str] = {}   # token → txt_path
 _pending_summary_context: dict[int, dict] = {}
 # {user_id: {txt_path, folder_name, chat_id, prompt_msg_id, timeout_task}}
@@ -367,6 +371,69 @@ async def _handle_transcribe_callback(update: Update, context: ContextTypes.DEFA
         await query.edit_message_text(query.message.text + "\n\nTranscription skipped.")
 
 
+def _spawn_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _youtube_upload_task(bot, chat_id: int, mp4_path: Path, label: str) -> None:
+    """Upload one finished recording and report the outcome in Telegram.
+
+    On failure nothing is marked, so the folder stays on disk for good.
+    """
+    folder = mp4_path.parent.name
+    await bot.send_message(chat_id, f"📺 Uploading {label} to YouTube…\nFolder: {folder}")
+    try:
+        marker = await youtube_mod.upload_recording(mp4_path)
+    except Exception as e:
+        logger.exception("YouTube upload failed for %s", mp4_path)
+        token = secrets.token_hex(8)
+        _pending_youtube_retry[token] = str(mp4_path)
+        await bot.send_message(
+            chat_id,
+            f"❌ YouTube upload failed — {label}\n{str(e)[:300]}\n\n"
+            f"The folder stays on the server and will NOT be auto-deleted.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔁 Retry upload", callback_data=f"yt_retry:{token}"),
+            ]]),
+        )
+        return
+
+    delete_on = youtube_mod.expiry_of(marker).astimezone(WIB).strftime("%d %b %Y")
+    processing = "" if marker["status"] == "processed" else "\n⏳ YouTube is still processing it."
+    await bot.send_message(
+        chat_id,
+        f"✅ Uploaded to YouTube — {label}\n{marker['url']}\nPrivacy: {marker['privacy']}{processing}\n\n"
+        f"Local folder {folder} is deleted on {delete_on} "
+        f"({youtube_mod.YOUTUBE_RETENTION_DAYS} days after upload).",
+    )
+
+
+async def cb_yt_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    mp4_path = _pending_youtube_retry.pop(query.data.split(":", 1)[1], None)
+    if not mp4_path or not Path(mp4_path).exists():
+        await query.answer("Nothing to retry — the file is gone or this button was already used.", show_alert=True)
+        return
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+    _spawn_background(_youtube_upload_task(context.bot, query.message.chat_id, Path(mp4_path), "recording"))
+
+
+async def _retention_loop() -> None:
+    """Hourly: delete recording folders whose YouTube copy is older than the retention window."""
+    while True:
+        if youtube_mod.is_configured():
+            try:
+                await asyncio.to_thread(
+                    youtube_mod.cleanup_expired, RECORDINGS_DIR, store.is_active_folder
+                )
+            except Exception:
+                logger.exception("Retention cleanup failed")
+        await asyncio.sleep(3600)
+
+
 async def cb_send_txt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -444,6 +511,105 @@ def _session_label(s: RecordingSession) -> str:
     return f"Session {s.session_num}: {name}"
 
 
+def _active_input_flow(user_id: int) -> str | None:
+    if store.has_pending(user_id):
+        return "recording setup"
+    if user_id in _reschedule_state:
+        return "rescheduling"
+    if _history_state.get(user_id, {}).get("sub_state") == "input_rename":
+        return "renaming a recording"
+    if user_id in _pending_summary_context:
+        return "AI summary context"
+    if user_id in _summary_conversations:
+        return "AI conversation"
+    return None
+
+
+async def _guard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bind temporary controls to the prompt that created the current state."""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        await query.answer("Unauthorized.", show_alert=True)
+        raise ApplicationHandlerStop
+
+    setup_controls = {
+        "confirm_new_session": ("confirm_session", "confirm_msg_id"),
+        "cancel_new_session": ("confirm_session", "confirm_msg_id"),
+        "skip_pwd": ("input_pwd", "pwd_msg_id"),
+        "use_default": ("waiting_name", "name_msg_id"),
+        "change_name": ("waiting_name", "name_msg_id"),
+        "skip_rec_name": ("input_rec_name", "rec_name_msg_id"),
+        "start_now": ("waiting_start", "start_msg_id"),
+        "schedule_later": ("waiting_start", "start_msg_id"),
+        "cancel_setup": ("waiting_start", "start_msg_id"),
+    }
+    data = query.data or ""
+    state = None
+    key = None
+    valid_step = True
+    if data in setup_controls:
+        expected, key = setup_controls[data]
+        state = dict(store.get_pending(user_id))
+        if key != "confirm_msg_id":
+            state["chat_id"] = user_id
+        valid_step = state.get("state") == expected
+    elif data.startswith("rt_"):
+        state, key = _history_state.get(user_id), "message_id"
+    elif data in {"reschedule_confirm", "reschedule_change", "reschedule_abort"}:
+        state, key = _reschedule_state.get(user_id), "confirm_msg_id"
+    elif data == "summary_ctx_skip":
+        state, key = _pending_summary_context.get(user_id), "prompt_msg_id"
+
+    if key and (
+        not state or not valid_step or not query.message
+        or state.get(key) != query.message.message_id
+        or state.get("chat_id", user_id) != query.message.chat_id
+    ):
+        await query.answer("This menu has expired. Use the latest prompt or start again.", show_alert=True)
+        raise ApplicationHandlerStop
+
+    # A second input workflow would steal replies from the current one.
+    opens_input = data in {"rt_rename", "rt_summarize", "rt_resummarize", "rt_ask_ai"}
+    opens_input = opens_input or data.startswith("summarize_txt:") or bool(re.fullmatch(r"reschedule_\d+", data))
+    flow = _active_input_flow(user_id)
+    if opens_input and flow:
+        await query.answer(f"Finish {flow}, or send /cancel first.", show_alert=True)
+        raise ApplicationHandlerStop
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel temporary interaction only; recordings and saved schedules continue."""
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        return
+    states = [
+        store.pop_pending(user_id),
+        _history_state.pop(user_id, {}),
+        _reschedule_state.pop(user_id, {}),
+        _pending_summary_context.pop(user_id, {}),
+        _summary_conversations.pop(user_id, {}),
+    ]
+    for state in states:
+        task = state.get("timeout_task")
+        if task and not task.done():
+            task.cancel()
+        for key in ("pwd_msg_id", "name_msg_id", "rec_name_msg_id", "start_msg_id",
+                    "confirm_msg_id", "message_id", "prompt_msg_id"):
+            if state.get(key):
+                try:
+                    await context.bot.edit_message_reply_markup(
+                        chat_id=state.get("chat_id", user_id), message_id=state[key], reply_markup=None,
+                    )
+                except Exception:
+                    pass
+    text = "✅ Input cancelled." if any(states) else "No input in progress."
+    await update.message.reply_text(
+        f"{text} Active recordings and saved schedules continue.\n"
+        "Use /record to start again, /stop to stop recording, or /schedule to manage schedules."
+    )
+
+
 # ── /record ───────────────────────────────────────────────────────────────────
 
 async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -455,14 +621,14 @@ async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     user_id = user.id
 
-    if store.has_pending(user_id):
-        await update.message.reply_text("Setup already in progress. Complete it first.")
+    flow = _active_input_flow(user_id)
+    if flow:
+        await update.message.reply_text(f"You are in {flow}. Complete it or send /cancel to start again.")
         return
 
-    url = context.args[0] if context.args else None
     active = store.active(user_id)
 
-    raw = context.args[0] if context.args else None
+    raw = " ".join(context.args) if context.args else None
 
     if raw:
         raw = await _preprocess_input(raw)
@@ -491,7 +657,7 @@ async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not url:
         store.update_pending(user_id, state="input_url")
         await update.message.reply_text(
-            "Send a Zoom URL or Meeting ID: (100s timeout)\n\n"
+            "Send a Zoom URL or Meeting ID: (100s timeout; /cancel to exit)\n\n"
             "Examples:\n"
             "• <code>https://zoom.us/j/97856007427?pwd=xxx</code>\n"
             "• <code>https://zoom.us/j/97856007427</code>\n"
@@ -508,10 +674,13 @@ async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             InlineKeyboardButton("Yes, Start", callback_data="confirm_new_session"),
             InlineKeyboardButton("Cancel", callback_data="cancel_new_session"),
         ]])
-        await update.message.reply_text(
+        msg = await update.message.reply_text(
             f"Currently recording:\n{lines}\n\nStart another recording?",
             reply_markup=kb,
         )
+        store.update_pending(user_id, state="confirm_session", confirm_msg_id=msg.message_id,
+                             chat_id=update.effective_chat.id,
+                             timeout_task=asyncio.create_task(_confirmation_timeout(user_id, context.bot)))
         return
 
     if not has_pwd and platform == "zoom":
@@ -526,6 +695,13 @@ async def _url_timeout(user_id: int, bot) -> None:
     if store.get_pending(user_id).get("state") == "input_url":
         store.pop_pending(user_id)
         await bot.send_message(user_id, "Timed out — no URL received. Send /record to try again.")
+
+
+async def _confirmation_timeout(user_id: int, bot) -> None:
+    await asyncio.sleep(100)
+    if store.get_pending(user_id).get("state") == "confirm_session":
+        store.pop_pending(user_id)
+        await bot.send_message(user_id, "Setup expired. Existing recordings continue. Use /record to try again.")
 
 
 async def _ask_meeting_password(user_id: int, bot) -> None:
@@ -607,7 +783,7 @@ async def _retire_prompt(user_id: int, bot, key: str, text: str) -> None:
 
 async def _name_timeout(user_id: int, bot) -> None:
     await asyncio.sleep(100)
-    if store.get_pending(user_id).get("state") == "waiting_name":
+    if store.get_pending(user_id).get("state") in ("waiting_name", "input_name"):
         store.update_pending(user_id, state=None)
         await _retire_prompt(user_id, bot, "name_msg_id",
                              f"Bot will join as '{DEFAULT_GUEST_NAME}'.")
@@ -639,7 +815,9 @@ async def cb_confirm_new_session(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("Session expired. Start again with /record.")
         return
 
-    await query.edit_message_text("Starting new session...")
+    _cancel_timeout(user_id)
+    store.update_pending(user_id, confirm_msg_id=None, chat_id=user_id)
+    await query.edit_message_text("Set up another recording…")
     # The concurrent-session confirm short-circuits the passcode check that the
     # first session gets, so re-do it here — otherwise every bot after the first
     # joins a passcode-protected meeting with no passcode.
@@ -652,6 +830,7 @@ async def cb_confirm_new_session(update: Update, context: ContextTypes.DEFAULT_T
 async def cb_cancel_new_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    _cancel_timeout(update.effective_user.id)
     store.pop_pending(update.effective_user.id)
     await query.edit_message_text("Cancelled.")
 
@@ -693,7 +872,8 @@ async def cb_change_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     store.update_pending(user_id, name_msg_id=None)
     _cancel_timeout(user_id)
     store.update_pending(user_id, state="input_name")
-    await query.edit_message_text("Type the bot name for this session:")
+    await query.edit_message_text("Type the bot name for this session (default in 100s). /cancel to exit.")
+    store.update_pending(user_id, timeout_task=asyncio.create_task(_name_timeout(user_id, context.bot)))
 
 
 # ── Recording name step ───────────────────────────────────────────────────────
@@ -783,11 +963,13 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 InlineKeyboardButton("Yes, Start", callback_data="confirm_new_session"),
                 InlineKeyboardButton("Cancel", callback_data="cancel_new_session"),
             ]])
-            await context.bot.send_message(
+            msg = await context.bot.send_message(
                 user_id,
                 f"Currently recording:\n{lines}\n\nStart another recording?",
                 reply_markup=kb,
             )
+            store.update_pending(user_id, state="confirm_session", confirm_msg_id=msg.message_id,
+                                 timeout_task=asyncio.create_task(_confirmation_timeout(user_id, context.bot)))
             return
         if not has_pwd and platform == "zoom":
             await _ask_meeting_password(user_id, context.bot)
@@ -808,6 +990,9 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # and defaulting on timeout — pressing Change Bot Name first is optional.
     elif state in ("waiting_name", "input_name"):
         name = update.message.text.strip()
+        if not name or len(name) > 80:
+            await update.message.reply_text("Use a bot name with 1–80 characters, or /cancel to exit.")
+            return
         _cancel_timeout(user_id)
         store.update_pending(user_id, guest_name=name, state=None)
         # Typed straight past the keyboard — its buttons are still live, so
@@ -821,6 +1006,9 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     elif state == "input_rec_name":
         prefix = update.message.text.strip()
+        if not prefix or len(prefix) > 80 or any(c in _RENAME_FORBIDDEN for c in prefix):
+            await update.message.reply_text("Use 1–80 characters without / \\ : * ? \" < > |, or press Skip.")
+            return
         _cancel_timeout(user_id)
         store.update_pending(user_id, state=None, prefix=prefix)
         await _retire_prompt(user_id, context.bot, "rec_name_msg_id",
@@ -889,8 +1077,14 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"📝 Recording: {html.escape(description)}\n"
             f"👤 Bot name: {html.escape(p.get('guest_name', DEFAULT_GUEST_NAME))}",
             reply_markup=kb,
+            parse_mode="HTML",
         )
 
+    else:
+        await update.message.reply_text(
+            "Use /record <Zoom link or Meeting ID> to set up a recording, "
+            "/history to find recordings, or /help for commands."
+        )
 
 
 async def _ask_start_or_schedule(user_id: int, bot) -> None:
@@ -905,9 +1099,17 @@ async def _ask_start_or_schedule(user_id: int, bot) -> None:
         ],
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel_setup")],
     ])
+    p = store.get_pending(user_id)
+    match = re.search(r"/(?:j|wc)/(\d+)", p.get("url") or "")
+    meeting_id = match.group(1) if match else "—"
+    passcode = "Included" if p.get("meeting_password") or not _needs_passcode_prompt(p) else "None"
     msg = await bot.send_message(
         user_id,
-        f"Start now or schedule for later? (setup expires in {SETUP_EXPIRY_HOURS}h)",
+        f"Ready to record\n\nMeeting ID: {meeting_id}\n"
+        f"Bot name: {p.get('guest_name', DEFAULT_GUEST_NAME)}\n"
+        f"Recording: {p.get('prefix') or 'Auto-name'}\nPasscode: {passcode}\n\n"
+        f"Start now or schedule in WIB (UTC+7)? Setup expires in {SETUP_EXPIRY_HOURS}h.\n"
+        "Use /cancel to start over.",
         reply_markup=kb,
     )
     store.update_pending(user_id, start_msg_id=msg.message_id)
@@ -1087,6 +1289,10 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
         asyncio.create_task(
             _transcribe_timeout(session_key, filename, chat_id, bot, msg.message_id)
         )
+        if youtube_mod.is_configured() and Path(filename).exists():
+            _spawn_background(
+                _youtube_upload_task(bot, chat_id, Path(filename), f"Session {session_num}")
+            )
 
     async def on_error(msg: str) -> None:
         await bot.send_message(chat_id, f"Session {session_num} error: {msg}")
@@ -1191,6 +1397,7 @@ async def _launch_recording(user_id: int, chat_id: int, bot, p: dict) -> None:
     recorder = ZoomRecorder(
         display=display_str,
         sink=sink_monitor,
+        user_id=user_id,
         guest_name=guest_name,
         recording_prefix=prefix,
         resolution=resolution,
@@ -1896,6 +2103,7 @@ def _reset_history_timeout(user_id: int, bot, chat_id: int, message_id: int) -> 
     state = _history_state.get(user_id)
     if not state:
         return
+    state.update(chat_id=chat_id, message_id=message_id)
     task = state.get("timeout_task")
     if task and not task.done():
         task.cancel()
@@ -1919,21 +2127,32 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Unauthorized.")
         return
 
-    all_folders = _get_recording_folders()
-    # Filter to folders that actually contain media files
-    folders = [f for f in all_folders if _find_media_files(f)]
+    flow = _active_input_flow(user.id)
+    if flow:
+        await update.message.reply_text(f"You are in {flow}. Complete it or send /cancel first.")
+        return
+    search = " ".join(context.args or []).strip()
+    folders = [f for f in _get_recording_folders()
+               if _find_media_files(f) and search.casefold() in f.name.casefold()]
     if not folders:
-        await update.message.reply_text("No recordings found.")
+        await update.message.reply_text(
+            f'No recordings matching "{search}". Use /history to view all.'
+            if search else "No recordings yet. Use /record to create your first recording."
+        )
         return
 
+    _cancel_history_timeout(user.id)
     _history_state[user.id] = {
         "folders": folders,
+        "search": search,
+        "chat_id": update.effective_chat.id,
         "page": 0,
         "selected_folder": None,
         "selected_file": None,
         "timeout_task": None,
     }
     msg = await update.effective_chat.send_message("Loading…")
+    _history_state[user.id]["message_id"] = msg.message_id
     await _show_history_page(user.id, update.effective_chat.id, context.bot, page=0, edit_msg=msg)
     _reset_history_timeout(user.id, context.bot, update.effective_chat.id, msg.message_id)
 
@@ -1945,6 +2164,8 @@ async def _show_history_page(user_id: int, chat_id: int, bot, page: int, edit_ms
 
     folders = state["folders"]
     total = len(folders)
+    page = max(0, min(page, max(0, (total - 1) // _RT_PAGE_SIZE)))
+    state["page"] = page
     start = page * _RT_PAGE_SIZE
     end = min(start + _RT_PAGE_SIZE, total)
 
@@ -1991,6 +2212,9 @@ async def _show_history_page(user_id: int, chat_id: int, bot, page: int, edit_ms
 
     listing = "\n\n".join(rows)
     text = f"📋 Recordings ({start + 1}–{end} of {total}):\n\n{listing}\n\nSelect number:"
+    if state.get("search"):
+        text = f'🔎 Filter: {html.escape(state["search"])}\n' + text
+    text += "\nSearch by name: /history keyword"
     markup = InlineKeyboardMarkup(num_buttons)
     if edit_msg:
         await edit_msg.edit_text(text, reply_markup=markup, parse_mode="HTML")
@@ -2009,6 +2233,7 @@ async def cb_rt_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     _history_state[user_id]["page"] = page
+    _history_state[user_id].pop("pending_delete", None)
     await _show_history_page(user_id, query.message.chat_id, context.bot, page=page, edit_msg=query.message)
     _reset_history_timeout(user_id, context.bot, query.message.chat_id, query.message.message_id)
 
@@ -2025,6 +2250,7 @@ async def cb_rt_folder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     folder = state["folders"][idx]
+    state.pop("pending_delete", None)
     state["selected_folder"] = folder
     media_files = _find_media_files(folder)
     page = state["page"]
@@ -2088,6 +2314,7 @@ async def cb_rt_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def _show_history_actions(message, state: dict) -> None:
+    state.pop("pending_delete", None)
     f = state["selected_file"]
     folder = state["selected_folder"]
     meta = _read_metadata(folder)
@@ -2117,6 +2344,7 @@ async def _show_history_actions(message, state: dict) -> None:
         if filebrowser_mod.is_configured():
             buttons.append([InlineKeyboardButton("📤 Share Link", callback_data="rt_share")])
         buttons.append([InlineKeyboardButton("✏️ Rename", callback_data="rt_rename")])
+        buttons.append([InlineKeyboardButton("🗑 Delete", callback_data="rt_delete")])
         buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="rt_cancel")])
     else:
         tx_note = "No transcript yet"
@@ -2130,13 +2358,16 @@ async def _show_history_actions(message, state: dict) -> None:
         if filebrowser_mod.is_configured():
             buttons.append([InlineKeyboardButton("📤 Share Link", callback_data="rt_share")])
         buttons.append([InlineKeyboardButton("✏️ Rename", callback_data="rt_rename")])
+        buttons.append([InlineKeyboardButton("🗑 Delete", callback_data="rt_delete")])
         buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="rt_cancel")])
 
+    buttons.insert(-1, [InlineKeyboardButton("◀️ Back to recordings", callback_data=f"rt_page:{state['page']}")])
     await message.edit_text(
         f"📁 {html.escape(folder.name)}\n"
         f"🎥 {html.escape(f.name)} ({_file_size_str(f)})\n"
         f"⏱ {dur_str}  ·  {tx_note}{sum_note}",
         reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML",
     )
 
 
@@ -2775,6 +3006,88 @@ async def cb_rt_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     _reset_history_timeout(user_id, context.bot, query.message.chat_id, query.message.message_id)
 
 
+async def cb_rt_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask for confirmation before permanently deleting a recording folder."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    state = _history_state.get(user_id)
+    if not state or not state.get("selected_folder"):
+        await query.edit_message_text("Session expired. Use /history to start again.")
+        return
+
+    folder = state["selected_folder"]
+    if store.is_active_folder(folder):
+        await query.edit_message_text(
+            f"⚠️ <b>{html.escape(folder.name)}</b> sedang direkam dan tidak dapat dihapus.",
+            parse_mode="HTML",
+        )
+        return
+
+    state["pending_delete"] = folder
+    await query.edit_message_text(
+        f"⚠️ Hapus permanen recording <b>{html.escape(folder.name)}</b>?\n"
+        "Semua file di dalam folder akan dihapus dan tidak dapat dipulihkan.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗑 Yes, Delete", callback_data="rt_delete_confirm"),
+            InlineKeyboardButton("❌ Cancel", callback_data="rt_delete_abort"),
+        ]]),
+    )
+    _reset_history_timeout(user_id, context.bot, query.message.chat_id, query.message.message_id)
+
+
+async def cb_rt_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    state = _history_state.get(user_id)
+    if not state or not state.get("selected_folder"):
+        await query.edit_message_text("Session expired. Use /history to start again.")
+        return
+
+    folder = state["selected_folder"]
+    if state.pop("pending_delete", None) != folder:
+        await query.edit_message_text("Delete confirmation expired. Use /history and select the recording again.")
+        return
+    if store.is_active_folder(folder):
+        await query.edit_message_text("⚠️ Recording sedang aktif dan tidak dapat dihapus.")
+        return
+    if not folder.exists():
+        _cancel_history_timeout(user_id)
+        _history_state.pop(user_id, None)
+        await query.edit_message_text("⚠️ Recording sudah tidak ditemukan.")
+        return
+
+    _cancel_history_timeout(user_id)
+    await query.edit_message_text(f"🗑 Menghapus {html.escape(folder.name)}…", parse_mode="HTML")
+    try:
+        await asyncio.to_thread(shutil.rmtree, folder)
+    except Exception as e:
+        logger.exception("Could not delete recording folder %s", folder)
+        await query.edit_message_text(
+            f"⚠️ Gagal menghapus recording: {html.escape(str(e))}", parse_mode="HTML"
+        )
+        _reset_history_timeout(user_id, context.bot, query.message.chat_id, query.message.message_id)
+        return
+
+    _cancel_history_timeout(user_id)
+    _history_state.pop(user_id, None)
+    await query.edit_message_text(f"✅ Recording <b>{html.escape(folder.name)}</b> dihapus.", parse_mode="HTML")
+
+
+async def cb_rt_delete_abort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    state = _history_state.get(user_id)
+    if not state or not state.get("selected_folder"):
+        await query.edit_message_text("Session expired. Use /history to start again.")
+        return
+    await _show_history_actions(query.message, state)
+    _reset_history_timeout(user_id, context.bot, query.message.chat_id, query.message.message_id)
+
+
 async def _handle_rename_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     state = _history_state.get(user_id)
@@ -2897,6 +3210,7 @@ async def cb_rt_rename_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         state["selected_file"] = new_path / (new_prefix + old_file.suffix)
     state["sub_state"] = None
     state["pending_rename"] = None
+    state["search"] = ""
     state["folders"] = [f for f in _get_recording_folders() if _find_media_files(f)]
 
     # Return to actions screen (it will show the updated folder name)
@@ -2968,13 +3282,19 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 _HELP_TEXT = (
     "🎙 <b>Zoomy — Zoom Meeting Recorder</b>\n\n"
+    "Send /record followed by a Zoom link or Meeting ID.\n"
+    "Then choose a name and start now or schedule in WIB (UTC+7).\n\n"
     "<b>Commands:</b>\n"
     "/record — Start recording a Zoom meeting\n"
     "/stop — Stop the active recording\n"
     "/peek — Screenshot of the active meeting\n"
     "/schedule — View, reschedule, or cancel scheduled recordings\n"
     "/status — Active count + total across all users\n"
-    "/history — Browse recordings; transcribe, rename, or AI summary"
+    "/ongoing — Details of your active recordings\n"
+    "/history [keyword] — Browse or search recordings by name\n"
+    "/cancel — Exit setup or input; recordings keep running\n"
+    "/exit — End the AI conversation\n"
+    "/help — Show this guide"
 )
 
 
@@ -3116,6 +3436,7 @@ async def _post_init(application: Application) -> None:
     _spawn_transcription_worker(application.bot)
     await _restore_schedules(application.bot)
     _cleanup_stale_wavs()
+    _spawn_background(_retention_loop())
 
 
 def _cleanup_stale_wavs() -> None:
@@ -3139,6 +3460,10 @@ def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
     app.add_error_handler(_error_handler)
     app.add_handler(MessageHandler(filters.ALL, _guard_unauthorized), group=-1)
+    app.add_handler(CallbackQueryHandler(_guard_callback), group=-1)
+    app.add_handler(CommandHandler(["start", "help"], cmd_unknown))
+    app.add_handler(CommandHandler("cancel",        cmd_cancel))
+    app.add_handler(CommandHandler("ongoing",       cmd_ongoing))
     app.add_handler(CommandHandler("record",        cmd_record))
     app.add_handler(CommandHandler("stop",          cmd_stop))
     app.add_handler(CommandHandler("peek",          cmd_peek))
@@ -3159,10 +3484,14 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_rt_share,            pattern="^rt_share$"))
     app.add_handler(CallbackQueryHandler(cb_rt_cancel,           pattern="^rt_cancel$"))
     app.add_handler(CallbackQueryHandler(cb_rt_rename,           pattern="^rt_rename$"))
+    app.add_handler(CallbackQueryHandler(cb_rt_delete,           pattern="^rt_delete$"))
+    app.add_handler(CallbackQueryHandler(cb_rt_delete_confirm,   pattern="^rt_delete_confirm$"))
+    app.add_handler(CallbackQueryHandler(cb_rt_delete_abort,     pattern="^rt_delete_abort$"))
     app.add_handler(CallbackQueryHandler(cb_rt_rename_confirm,   pattern="^rt_rename_confirm$"))
     app.add_handler(CallbackQueryHandler(cb_rt_rename_change,    pattern="^rt_rename_change$"))
     app.add_handler(CallbackQueryHandler(cb_rt_rename_abort,     pattern="^rt_rename_abort$"))
     app.add_handler(CallbackQueryHandler(cb_send_txt,            pattern=r"^send_txt:"))
+    app.add_handler(CallbackQueryHandler(cb_yt_retry,            pattern=r"^yt_retry:"))
     app.add_handler(CallbackQueryHandler(cb_summarize_txt,       pattern=r"^summarize_txt:"))
     app.add_handler(CallbackQueryHandler(cb_summary_ctx_skip,    pattern="^summary_ctx_skip$"))
     app.add_handler(CallbackQueryHandler(cb_start_now,           pattern="^start_now$"))
@@ -3191,7 +3520,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(_handle_transcribe_callback, pattern=r"^(transcribe_medium|transcribe_large|skip):"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))  # catch-all — must be last
-    logger.info("Zoomy bot started (@baboonrecord_bot)")
+    logger.info("Zoomy bot started (@baboon_zoomy_bot)")
     app.run_polling(drop_pending_updates=True)
 
 

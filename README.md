@@ -31,12 +31,17 @@ Zoomy uses Playwright to join a Zoom web client session on a virtual display (Xv
 ### BotFather `/setcommands`
 
 ```
+start - Help and getting started
 record - Start recording a Zoom meeting
 stop - Stop the active recording
 peek - Screenshot with duration, size, and URL
 schedule - View, reschedule, or cancel scheduled recordings
 status - Active count + total across all users
-history - Browse recordings, transcribe, rename, or AI summary
+history - Browse or search recordings by name
+ongoing - Details of your active recordings
+cancel - Exit setup or input without stopping recordings
+help - Show commands and getting started
+exit - End the AI conversation
 ```
 
 ### Command reference
@@ -48,9 +53,13 @@ history - Browse recordings, transcribe, rename, or AI summary
 | `/peek` | Screenshot of the active meeting with duration, size, and URL |
 | `/schedule` | View, reschedule, or cancel scheduled recordings |
 | `/status` | Your active count + total across all users |
-| `/history` | Browse recordings; transcribe, rename, send transcript, or AI summary |
+| `/history [keyword]` | Browse or search recordings by folder name; transcribe, rename, send transcript, or AI summary |
+| `/start`, `/help` | Getting started and command list |
+| `/ongoing` | Details of your active recordings |
+| `/cancel` | Cancel temporary setup/input and leave AI chat; active recordings and saved schedules continue |
+| `/exit` | Leave the AI conversation |
 
-Any unknown command (including `/start`) returns the command list.
+Unknown commands return the getting-started guide. Text outside an active input flow returns recovery instructions. Use `/cancel` to abandon setup, rename, rescheduling, or AI input before starting another flow. Temporary buttons are bound to their current user, chat, and prompt; old menus cannot act on a newer setup or history selection.
 
 ### `/record` flow
 
@@ -62,7 +71,7 @@ Any unknown command (including `/start`) returns the command list.
 2. **Password** — if URL/ID has no embedded password, bot asks for the plain passcode (Skip to proceed without)
 3. **Bot name** — change the display name, or use the default (100s timeout → auto-selects default)
 4. **Recording name** — type a label used as filename prefix, or skip (100s timeout → auto-name)
-5. **Start now or schedule** — start immediately, or pick a future date/time in WIB (UTC+7)
+5. **Review, then start or schedule** — check the Meeting ID, bot name, recording name, and whether a passcode is included (the secret is never echoed). Start immediately or pick a future date/time in WIB (UTC+7). Use `/cancel` to correct the setup. This decision expires after `SETUP_EXPIRY_HOURS` (default 3 hours).
 6. Bot joins meeting muted + camera off
 7. **Audio wait** — if `AUDIO_WAIT_TIMEOUT` is non-zero, FFmpeg is held until audio is detected on the virtual sink. If silence persists beyond 5 s, a "⏸ waiting…" notification fires; when audio is detected, a "▶️ started" notification follows. In an active meeting audio is usually detected immediately with no notification at all. Use `/stop` to abort while waiting.
 8. Recording starts → initial screenshot sent
@@ -92,8 +101,10 @@ zoomy/
 │   ├── transcriber.py    # faster-whisper wrapper (MP4 → .txt + .srt)
 │   ├── summarizer.py     # ChatGPT Codex wrapper (transcript → AI summary)
 │   ├── filebrowser.py    # FileBrowser Quantum API wrapper (public share links)
+│   ├── youtube.py        # YouTube upload + 7-day local retention cleanup
 │   ├── store.py          # SessionStore — per-user in-memory state
 │   ├── zoom_login.py     # One-off helper: save a signed-in Zoom session
+│   ├── youtube_login.py  # One-off helper: authorize YouTube uploads
 │   ├── entrypoint.sh     # Container startup (PulseAudio + Xvfb base)
 │   ├── Dockerfile
 │   └── requirements.txt
@@ -101,7 +112,7 @@ zoomy/
 │   ├── config.example.yaml # private CLIProxyAPI configuration template
 │   └── auths/              # persisted ChatGPT OAuth tokens (gitignored)
 ├── recordings/           # MP4 output (bind-mounted into container)
-├── secrets/              # zoom_state.json — saved Zoom login (gitignored)
+├── secrets/              # zoom_state.json, youtube_token.json — saved logins (gitignored)
 ├── docker-compose.yml
 └── .env.example
 ```
@@ -144,10 +155,16 @@ AUDIO_RMS_THRESHOLD=100  # RMS level (0–32767) that counts as "audio present"
 WHISPER_INITIAL_PROMPT=  # domain context injected into Whisper's context window (leave empty for built-in default)
 WHISPER_HOTWORDS=        # comma-separated words to boost during beam search (leave empty for built-in default)
 
+FILEBROWSER_ENABLED=false           # master switch for the Share Link buttons (default off); set true to turn them back on
 FILEBROWSER_URL=                    # e.g. https://share.example.com; leave empty to disable the Share Link buttons
 FILEBROWSER_API_TOKEN=              # long-lived API token created in FileBrowser Quantum's UI
 FILEBROWSER_SOURCE_NAME=recordings  # source name as configured in FileBrowser Quantum's config.yaml
 FILEBROWSER_SHARE_EXPIRY_DAYS=90    # share links auto-expire after this many days
+
+YOUTUBE_TOKEN_PATH=/secrets/youtube_token.json  # created by bot/youtube_login.py; missing file = YouTube upload disabled
+YOUTUBE_PRIVACY=unlisted            # unlisted | private | public
+YOUTUBE_RETENTION_DAYS=7            # delete the local recording folder this many days after a successful upload
+YOUTUBE_CATEGORY_ID=22              # YouTube category (22 = People & Blogs)
 ```
 
 Get your Telegram user ID from [@userinfobot](https://t.me/userinfobot).
@@ -222,15 +239,17 @@ After selecting a recording from the `/history` listing:
 
 | State | Available actions |
 |---|---|
-| No transcript | 🎙 Transcribe (Medium / Large) · 📤 Share Link · ✏️ Rename |
-| Transcript exists | 📄 Send Subs · 🔄 Re-Subs · 🤖 AI Summary · 📤 Share Link · ✏️ Rename |
-| Transcript + Summary | 📄 Send Subs · 🔄 Re-Subs · 📋 Send Summary · 💬 Ask AI · 📤 Share Link · ✏️ Rename |
+| No transcript | 🎙 Transcribe (Medium / Large) · 📤 Share Link · ✏️ Rename · 🗑 Delete |
+| Transcript exists | 📄 Send Subs · 🔄 Re-Subs · 🤖 AI Summary · 📤 Share Link · ✏️ Rename · 🗑 Delete |
+| Transcript + Summary | 📄 Send Subs · 🔄 Re-Subs · 📋 Send Summary · 💬 Ask AI · 📤 Share Link · ✏️ Rename · 🗑 Delete |
 
-📤 Share Link only appears when `FILEBROWSER_URL` + `FILEBROWSER_API_TOKEN` are set.
+📤 Share Link only appears when `FILEBROWSER_ENABLED=true` and `FILEBROWSER_URL` + `FILEBROWSER_API_TOKEN` are set.
 
 **Re-Subs** opens a second choice for the Whisper `Medium` or `Large` model before creating the replacement transcript and subtitle files.
 
 **Rename** renames the folder and all files inside that share the same stem prefix.
+
+**Delete** permanently removes the selected recording folder after confirmation.
 
 ## AI Summary
 
@@ -273,7 +292,28 @@ Recordings routinely exceed Telegram's 50MB bot-upload limit, so instead of send
 3. Tapping the button copies the link straight to your clipboard (Telegram's native copy-to-clipboard button) rather than opening a page
 4. Message shows the exact expiry date/time (WIB); link stops working then — the share row stays visible in FileBrowser's admin panel afterward so it can still be edited/extended, but public access is cut off exactly at expiry regardless
 
-Requires `FILEBROWSER_URL` + `FILEBROWSER_API_TOKEN`; both buttons are hidden entirely if unset.
+**Currently disabled by default** — recordings are uploaded to YouTube instead (see below). Set `FILEBROWSER_ENABLED=true` to bring it back; it also requires `FILEBROWSER_URL` + `FILEBROWSER_API_TOKEN`. With any of the three missing, both buttons are hidden entirely.
+
+## YouTube upload
+
+Saves disk on the server: every finished recording is uploaded to your YouTube channel, and the local folder is deleted a week later.
+
+**Flow:**
+1. When a recording stops and the file is ready, the bot starts the upload immediately (one at a time, resumable, retried on transient errors) and reports progress in Telegram. Transcription runs in parallel from the same file.
+2. When YouTube accepts the video, a `.youtube.json` marker (video ID, privacy, upload time) is written into the recording folder and the bot sends the link plus the exact deletion date.
+3. An hourly job deletes the **whole folder** (mp4, txt, srt, `.metadata.json`, summaries — everything) once the marker is `YOUTUBE_RETENTION_DAYS` old. Right before deleting, it asks YouTube whether the video is still there and processed; if the check fails or says otherwise, the folder is kept.
+4. If the upload fails or YouTube rejects the video, no marker is written, so the folder is **never** auto-deleted. The bot reports the error with a **🔁 Retry upload** button.
+
+The 7 days count from the upload, not from the recording. A folder whose upload never succeeded stays forever until you remove it yourself.
+
+**Share Link vs. YouTube:** FileBrowser share links are turned off by default (`FILEBROWSER_ENABLED=false`) because they point at the local file and die when the folder is deleted. The YouTube link is what the bot sends.
+
+**One-time setup:**
+1. In [Google Cloud Console](https://console.cloud.google.com/) create a project (no billing needed), enable **YouTube Data API v3**, configure the OAuth consent screen and set it to **In production** (in *Testing*, Google expires the token after 7 days), then create an OAuth client of type **Desktop app** and download its JSON.
+2. Verify the channel's phone number at [youtube.com/verify](https://www.youtube.com/verify). Unverified channels are limited to 15-minute videos; verified ones allow up to 12 hours / 256 GB per video.
+3. On your laptop: `pip install google-auth-oauthlib && python3 bot/youtube_login.py client_secret.json`, sign in as the channel owner, then copy `secrets/youtube_token.json` to the server's `secrets/` and `docker compose up -d --build`.
+
+**Limits:** the API allows 100 `videos.insert` calls per day per project. Meetings longer than 12 hours cannot be uploaded as one video.
 
 ## Transcription
 
@@ -309,7 +349,7 @@ Schedules persist across bot restarts via `recordings/schedules.json`. On startu
 {randomname}_{YYYYMMDD}/    # auto-named session
 ```
 
-## Planned features
+## Future development
 
 ### Scheduling
 - **Recurring schedule** — record the same meeting every day/week at the same time; ideal for standups
@@ -317,8 +357,8 @@ Schedules persist across bot restarts via `recordings/schedules.json`. On startu
 - **Clone schedule** — duplicate a pending schedule to a new time without re-entering all details
 
 ### History & file management
-- **Delete from `/history`** — delete a recording folder directly from the bot with a confirm step
-- **Search in `/history`** — filter the listing by keyword instead of paginating through everything
+- ~~**Delete from `/history`**~~ ✅ — delete a recording folder directly from the bot with a confirm step
+- ~~**Search in `/history`**~~ ✅ — `/history keyword` filters folder names case-insensitively; recording details include a Back to recordings button
 - **Auto-cleanup** — automatically delete recordings older than a configurable number of days
 - ~~**`/download`**~~ ✅ — superseded by **Share Link**: generates a public FileBrowser Quantum link instead of hitting Telegram's 50MB upload cap
 
@@ -394,6 +434,7 @@ Example: chrome = 120px → `crop=1920:1080:0:120` → output is 1920×1080
 - Bot joins meetings muted with camera off
 - Meeting-end detection polls `document.body.innerText` every 3s — stops automatically when the host ends the meeting
 - Stop notification includes duration, file size, and stop reason (host ended vs manually stopped)
+- Each recording's `.metadata.json` includes the Telegram `user_id` that started it
 - Displayed duration is measured from the moment FFmpeg starts (not browser join) and excludes paused time, so it stays consistent with the file size across `/peek` and the hourly notice
 - The hourly "still running" notice and the silence warning both include a live screenshot, like `/peek`
 - FFmpeg encodes at CRF 26, `veryfast` preset, 24fps — balanced quality/size for meeting content
@@ -401,3 +442,12 @@ Example: chrome = 120px → `crop=1920:1080:0:120` → output is 1920×1080
 - Meetings that require a signed-in Zoom account (guest join rejected → "Sign in to join this meeting") are detected on join; the recording is aborted with a notification instead of hanging
 - AI Summary calls retry automatically (exponential backoff, up to 3 attempts) on transient CLIProxyAPI 408/429/5xx errors before surfacing a failure to the user
 - If `AUTHORIZED_USER_IDS` is set, any message from an unlisted user gets a one-time rejection reply and `OWNER_TELEGRAM_ID` gets a heads-up with the sender's username/ID
+
+## Local flow regression tests
+
+```bash
+python -m unittest discover -s tests -v
+python -m compileall -q bot tests
+```
+
+Install `bot/requirements.txt` first. The flow tests stub only the transcription module, so `faster-whisper` can be omitted for this suite. Telegram calls, media capture, and AI requests are not executed. See [the flow review](docs/flow-review.md) for findings, changes, and remaining validation.
